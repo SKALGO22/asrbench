@@ -1,0 +1,11 @@
+venv/
+.hf/
+__pycache__/
+data/LibriSpeech/
+results*/**/traces/
+results*/**/onnx/
+results*/**/trt_cache/
+micro/pmb
+logs/
+*.tgz
+*.tar.gz
