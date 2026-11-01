@@ -25,7 +25,7 @@ def gpu_name() -> str:
 def gpu_slug() -> str:
     """Short, filesystem-safe GPU identifier, e.g. 'rtx4090', 'gtx1080ti', 'l4'."""
     n = gpu_name().lower()
-    for k in ["4090", "3090", "2080 ti", "2080", "1080 ti", "1080", "3050", "a6000", "a5000", "a100", "h100",
+    for k in ["4090", "3090", "2080 ti", "2080", "1080 ti", "1080", "3050", "a6000", "a5000", "a100", "h100", "l40s",
               "l4", "t4", "a10"]:
         if k in n:
             pre = "rtx" if "rtx" in n else ("gtx" if "gtx" in n else "")
