@@ -1,4 +1,4 @@
-// Megakernel v1: the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
+// Megakernel v2 (v1 + block-parallel coalesced attention + single-pass LayerNorm statistics): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
 //
 // Stages per layer (each separated by a grid-wide barrier, 10 per layer):
 //   S1  LN_ff1(resid) -> FFN1 up (512->2048) + SiLU                -> h
@@ -100,32 +100,42 @@ __device__ __forceinline__ float warp_max(float v) {
 
 __device__ __forceinline__ float silu(float x) { return x / (1.f + __expf(-x)); }
 
-__device__ float block_sum(float v, float* red) {
+// Reduce n (<= 2*TMAX) per-thread values across the block in ONE round of barriers. red: >= 2*TMAX*32 floats.
+__device__ void block_reduce_arr(float* v, int n, float* red) {
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
-  v = warp_sum(v);
+  for (int i = 0; i < n; ++i) v[i] = warp_sum(v[i]);
   __syncthreads();
-  if (lane == 0) red[warp] = v;
+  if (lane == 0)
+    for (int i = 0; i < n; ++i) red[i * 32 + warp] = v[i];
   __syncthreads();
-  float tot = 0.f;
-  for (int i = 0; i < nw; ++i) tot += red[i];
-  return tot;
+  for (int i = 0; i < n; ++i) {
+    float s = 0.f;
+    for (int w = 0; w < nw; ++w) s += red[i * 32 + w];
+    v[i] = s;
+  }
 }
 
 // Copy src[T][K] into shared memory; optionally LayerNorm each row (g != nullptr) and apply SiLU (act == 1).
+// Single-pass statistics (sum and sum of squares for all T rows reduced together): 2 block barriers per LayerNorm.
 __device__ void block_load(const float* __restrict__ src, int T, int K, const float* g, const float* b,
                            float eps, int act, float* xs, float* red) {
-  for (int i = threadIdx.x; i < T * K; i += blockDim.x) xs[i] = src[i];
-  __syncthreads();
-  if (g == nullptr) return;
-  for (int t = 0; t < T; ++t) {
-    float* row = xs + t * K;
-    float s = 0.f;
-    for (int k = threadIdx.x; k < K; k += blockDim.x) s += row[k];
-    const float mean = block_sum(s, red) / K;
-    float v = 0.f;
-    for (int k = threadIdx.x; k < K; k += blockDim.x) { const float d = row[k] - mean; v += d * d; }
-    const float rstd = rsqrtf(block_sum(v, red) / K + eps);
+  float v[2 * TMAX];
+#pragma unroll
+  for (int i = 0; i < 2 * TMAX; ++i) v[i] = 0.f;
+  for (int t = 0; t < T; ++t)
     for (int k = threadIdx.x; k < K; k += blockDim.x) {
+      const float x = src[t * K + k];
+      xs[t * K + k] = x;
+      v[2 * t] += x;
+      v[2 * t + 1] += x * x;
+    }
+  if (g == nullptr) { __syncthreads(); return; }
+  block_reduce_arr(v, 2 * T, red);
+  for (int t = 0; t < T; ++t) {
+    const float mean = v[2 * t] / K;
+    const float rstd = rsqrtf(fmaxf(v[2 * t + 1] / K - mean * mean, 0.f) + eps);
+    float* row = xs + t * K;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {      // each thread normalises the elements it loaded
       float y = (row[k] - mean) * rstd * g[k] + b[k];
       if (act == 1) y = silu(y);
       row[k] = y;
@@ -159,61 +169,76 @@ __device__ __forceinline__ void row_dot(const half* __restrict__ wr, int K, cons
   for (int t = 0; t < TMAX; ++t) acc[t] = warp_sum(acc[t]);
 }
 
-// One (head, query) attention item, computed by one warp.
-__device__ void attention_item(const MKArgs& a, const LayerParams& P, const float* kvK, const float* kvV,
-                               int head_ring, int h, int t, float* sc_smem, int lane) {
+__device__ __forceinline__ int ring_slot(int head_ring, int j) { int s = head_ring + j; return s >= CACHE ? s - CACHE : s; }
+
+// One (head, query) attention item, computed by one whole block:
+//   scores: warp w takes keys w, w+wpb, ...; lanes split the 64 head dims (coalesced loads), warp-reduce per key
+//   softmax: warp 0 over <= 74 scores in shared memory
+//   output:  thread (d, g) sums keys g, g+G, ... for dim d; groups combined through shared memory
+// scratch: >= 128 + NKEY_PAD + (blockDim/64)*64 floats
+__device__ void attention_block(const MKArgs& a, const LayerParams& P, const float* kvK, const float* kvV,
+                                int head_ring, int h, int t, float* scratch) {
   const int T = a.T, NK = CACHE + T;
-  const float* q = a.qkv + t * 3 * D + h * DK;
-  const float* pu = P.pos_u + h * DK;
-  const float* pv = P.pos_v + h * DK;
-  float sc[3];
-  float mx = NEG_INF;
-#pragma unroll
-  for (int m = 0; m < 3; ++m) {
-    const int j = lane + 32 * m;
-    sc[m] = NEG_INF;
-    if (j < NK && a.mask[t * NK + j] == 0) {
-      const float* krow = (j < CACHE) ? kvK + ((head_ring + j) % CACHE) * D + h * DK
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, wpb = blockDim.x >> 5;
+  float* qu = scratch;
+  float* qv = scratch + DK;
+  float* sc = scratch + 2 * DK;
+  float* part = sc + NKEY_PAD;
+  if (threadIdx.x < DK) {
+    const float qd = a.qkv[t * 3 * D + h * DK + threadIdx.x];
+    qu[threadIdx.x] = qd + P.pos_u[h * DK + threadIdx.x];
+    qv[threadIdx.x] = qd + P.pos_v[h * DK + threadIdx.x];
+  }
+  __syncthreads();
+  for (int j = warp; j < NK; j += wpb) {
+    float s = NEG_INF;
+    if (a.mask[t * NK + j] == 0) {
+      const float* krow = (j < CACHE) ? kvK + ring_slot(head_ring, j) * D + h * DK
                                       : a.qkv + (j - CACHE) * 3 * D + D + h * DK;
+      float v = qu[lane] * krow[lane] + qu[lane + 32] * krow[lane + 32];
       const int pi = a.pidx[t * NK + j];
-      const float* prow = (pi >= 0) ? P.p + ((size_t)h * a.npos + pi) * DK : nullptr;
-      float s = 0.f;
-      for (int d = 0; d < DK; ++d) {
-        const float qd = q[d];
-        s += (qd + pu[d]) * krow[d];
-        if (prow) s += (qd + pv[d]) * prow[d];
+      if (pi >= 0) {
+        const float* prow = P.p + ((size_t)h * a.npos + pi) * DK;
+        v += qv[lane] * prow[lane] + qv[lane + 32] * prow[lane + 32];
       }
-      sc[m] = s * a.att_scale;
-      mx = fmaxf(mx, sc[m]);
+      s = warp_sum(v) * a.att_scale;
+    }
+    if (lane == 0) sc[j] = s;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    float m = NEG_INF;
+    for (int j = lane; j < NK; j += 32) m = fmaxf(m, sc[j]);
+    m = warp_max(m);
+    float sum = 0.f;
+    for (int j = lane; j < NK; j += 32) {
+      const float e = (m == NEG_INF || sc[j] == NEG_INF) ? 0.f : __expf(sc[j] - m);
+      sc[j] = e;
+      sum += e;
+    }
+    sum = warp_sum(sum);
+    const float inv = sum > 0.f ? 1.f / sum : 0.f;          // all keys masked -> zeros (NeMo semantics)
+    for (int j = lane; j < NK; j += 32) sc[j] *= inv;
+  }
+  __syncthreads();
+  const int d = threadIdx.x % DK, g = threadIdx.x / DK, G = blockDim.x / DK;
+  float o = 0.f;
+  for (int j = g; j < NK; j += G) {
+    const float w = sc[j];
+    if (w != 0.f) {
+      const float* vrow = (j < CACHE) ? kvV + ring_slot(head_ring, j) * D + h * DK
+                                      : a.qkv + (j - CACHE) * 3 * D + 2 * D + h * DK;
+      o += w * vrow[d];
     }
   }
-  mx = warp_max(mx);
-  float* out = a.att + t * D + h * DK;
-  if (mx == NEG_INF) {           // every key masked: NeMo outputs zeros
-    out[lane] = 0.f; out[lane + 32] = 0.f;
-    return;
+  part[g * DK + d] = o;
+  __syncthreads();
+  if (threadIdx.x < DK) {
+    float acc = 0.f;
+    for (int gg = 0; gg < G; ++gg) acc += part[gg * DK + threadIdx.x];
+    a.att[t * D + h * DK + threadIdx.x] = acc;
   }
-  float e[3], sum = 0.f;
-#pragma unroll
-  for (int m = 0; m < 3; ++m) { e[m] = (sc[m] == NEG_INF) ? 0.f : __expf(sc[m] - mx); sum += e[m]; }
-  sum = warp_sum(sum);
-  const float inv = 1.f / sum;
-#pragma unroll
-  for (int m = 0; m < 3; ++m) { const int j = lane + 32 * m; if (j < NKEY_PAD) sc_smem[j] = e[m] * inv; }
-  __syncwarp();
-  for (int d = lane; d < DK; d += 32) {
-    float o = 0.f;
-    for (int j = 0; j < NK; ++j) {
-      const float w = sc_smem[j];
-      if (w != 0.f) {
-        const float* vrow = (j < CACHE) ? kvV + ((head_ring + j) % CACHE) * D + h * DK
-                                        : a.qkv + (j - CACHE) * 3 * D + 2 * D + h * DK;
-        o += w * vrow[d];
-      }
-    }
-    out[d] = o;
-  }
-  __syncwarp();
+  __syncthreads();
 }
 
 #define STAMP(idx) do { if (a.timers && blockIdx.x == 0 && threadIdx.x == 0) a.timers[(idx)] = gtimer(); } while (0)
@@ -222,8 +247,8 @@ extern "C" __global__ void __launch_bounds__(512) mk_kernel(MKArgs a) {
   cg::grid_group grid = cg::this_grid();
   extern __shared__ float smem[];
   float* xs = smem;                           // TMAX*DFF floats
-  float* red = xs + TMAX * DFF;               // 64 floats
-  float* attw = red + 64;                     // warps_per_block * NKEY_PAD floats
+  float* red = xs + TMAX * DFF;               // 2*TMAX*32 = 256 floats
+  float* attw = red + 256;                    // 1024 floats attention scratch
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, wpb = blockDim.x >> 5;
   const int gwarp = blockIdx.x * wpb + warp, nwarps = gridDim.x * wpb;
   const int gtid = blockIdx.x * blockDim.x + threadIdx.x, nthreads = gridDim.x * blockDim.x;
@@ -269,8 +294,8 @@ extern "C" __global__ void __launch_bounds__(512) mk_kernel(MKArgs a) {
     grid.sync(); STAMP(ts + 2);
 
     // S4: attention core
-    for (int it = gwarp; it < NH * T; it += nwarps)
-      attention_item(a, P, kvK, kvV, head_ring, it / T, it % T, attw + warp * NKEY_PAD, lane);
+    for (int it = blockIdx.x; it < NH * T; it += gridDim.x)
+      attention_block(a, P, kvK, kvV, head_ring, it / T, it % T, attw);
     grid.sync(); STAMP(ts + 3);
 
     // S5: output projection; resid += out; commit new K/V into the oldest ring slots
@@ -346,7 +371,7 @@ extern "C" __global__ void __launch_bounds__(512) mk_kernel(MKArgs a) {
 }
 
 // ------------------------------------------------------------------------------------------- host API (ctypes)
-extern "C" int mk_smem_bytes(int threads) { return (TMAX * DFF + 64 + (threads / 32) * NKEY_PAD) * (int)sizeof(float); }
+extern "C" int mk_smem_bytes(int threads) { (void)threads; return (TMAX * DFF + 256 + 1024) * (int)sizeof(float); }
 
 extern "C" int mk_prepare(int threads) {
   const int smem = mk_smem_bytes(threads);
