@@ -55,6 +55,7 @@ def main():
     ap.add_argument("--layers", type=int, default=0, help="only the first N layers (debug); 0 = all")
     ap.add_argument("--threads", type=int, default=256)
     ap.add_argument("--blocks", type=int, default=0)
+    ap.add_argument("--flags", type=int, default=3, help="bit0 L2 prefetch, bit1 fused LN_out (default both)")
     ap.add_argument("--tol", type=float, default=0.0, help="max allowed relative error (default: 2e-2 FP16, 1e-3 FP32)")
     args = ap.parse_args()
     torch.manual_seed(0)
@@ -65,14 +66,14 @@ def main():
     print(f"[mk] constants: T={consts['T']} NK={consts['NK']} npos={consts['npos']} "
           f"masks for cache lengths {sorted(consts['masks'])[:3]}...{sorted(consts['masks'])[-2:]} ({time.time()-t0:.1f}s)")
     mk = MegakernelEncoder(model, consts, threads=args.threads, blocks=args.blocks or None,
-                           use_kernel=not args.reference, device=dev)
+                           use_kernel=not args.reference, device=dev, flags=args.flags)
     if args.layers:
         mk.nl = args.layers
         mk.layers = mk.layers[:args.layers]
         if mk.use_kernel:
             mk.params = mk.params[:args.layers * len(mk.layers[0])].contiguous()
     print(f"[mk] mode: {'reference (PyTorch)' if args.reference else f'CUDA kernel, grid {mk.blocks} x {mk.threads}'}"
-          f", layers {mk.nl}")
+          f", layers {mk.nl}, flags {args.flags}")
 
     xs, xlen, drop = random_chunks(model, args.warm + args.steps, dev, seed=7)
     c, t, cl = nemo_initial(model, dev)

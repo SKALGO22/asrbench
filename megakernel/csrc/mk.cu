@@ -1,4 +1,4 @@
-// Megakernel v2 (v1 + block-parallel coalesced attention + single-pass LayerNorm statistics): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
+// Megakernel v3 (v2 + L2 prefetch of the next layer's weights, LayerNorm-out fused into the next layer, faster attention): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
 //
 // Stages per layer (each separated by a grid-wide barrier, 10 per layer):
 //   S1  LN_ff1(resid) -> FFN1 up (512->2048) + SiLU                -> h
@@ -73,7 +73,7 @@ struct MKArgs {
   int n_layers;
   int T;
   int npos;
-  int pad_;
+  int flags;                  // bit0: L2-prefetch next layer's weights, bit1: fuse LN_out into the next layer's S1
   float eps;
   float fc_factor;
   float att_scale;
@@ -144,6 +144,40 @@ __device__ void block_load(const float* __restrict__ src, int T, int K, const fl
   __syncthreads();
 }
 
+// LayerNorm rows of xs (already in shared memory) in place.
+__device__ void block_ln_inplace(float* xs, int T, int K, const float* g, const float* b, float eps, int act, float* red) {
+  float v[2 * TMAX];
+#pragma unroll
+  for (int i = 0; i < 2 * TMAX; ++i) v[i] = 0.f;
+  for (int t = 0; t < T; ++t)
+    for (int k = threadIdx.x; k < K; k += blockDim.x) { const float x = xs[t * K + k]; v[2 * t] += x; v[2 * t + 1] += x * x; }
+  block_reduce_arr(v, 2 * T, red);
+  for (int t = 0; t < T; ++t) {
+    const float mean = v[2 * t] / K;
+    const float rstd = rsqrtf(fmaxf(v[2 * t + 1] / K - mean * mean, 0.f) + eps);
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+      float y = (xs[t * K + k] - mean) * rstd * g[k] + b[k];
+      if (act == 1) y = silu(y);
+      xs[t * K + k] = y;
+    }
+  }
+  __syncthreads();
+}
+
+__device__ __forceinline__ void prefetch_l2(const void* p) { asm volatile("prefetch.global.L2 [%0];" ::"l"(p)); }
+
+// Fire-and-forget L2 prefetch of one layer's eight weight matrices (~12.6 MB), spread over every thread of the grid.
+__device__ void prefetch_layer(const LayerParams& P, int gtid, int nthreads) {
+  const half* mats[8] = {P.w_ff1_1, P.w_ff1_2, P.w_qkv, P.w_o, P.w_pw1, P.w_pw2, P.w_ff2_1, P.w_ff2_2};
+  const int nel[8] = {DFF * D, D * DFF, 3 * D * D, D * D, 2 * D * D, D * D, DFF * D, D * DFF};
+#pragma unroll
+  for (int m = 0; m < 8; ++m) {
+    const char* base = reinterpret_cast<const char*>(mats[m]);
+    const int lines = nel[m] * 2 / 128;
+    for (int i = gtid; i < lines; i += nthreads) prefetch_l2(base + (size_t)i * 128);
+  }
+}
+
 // acc[t] = dot(W_row, xs[t]) for t < T; result valid in ALL lanes. K must be a multiple of 256.
 __device__ __forceinline__ void row_dot(const half* __restrict__ wr, int K, const float* xs, int T, int lane,
                                         float acc[TMAX]) {
@@ -190,20 +224,30 @@ __device__ void attention_block(const MKArgs& a, const LayerParams& P, const flo
     qv[threadIdx.x] = qd + P.pos_v[h * DK + threadIdx.x];
   }
   __syncthreads();
-  for (int j = warp; j < NK; j += wpb) {
-    float s = NEG_INF;
-    if (a.mask[t * NK + j] == 0) {
-      const float* krow = (j < CACHE) ? kvK + ring_slot(head_ring, j) * D + h * DK
-                                      : a.qkv + (j - CACHE) * 3 * D + D + h * DK;
-      float v = qu[lane] * krow[lane] + qu[lane + 32] * krow[lane + 32];
-      const int pi = a.pidx[t * NK + j];
-      if (pi >= 0) {
-        const float* prow = P.p + ((size_t)h * a.npos + pi) * DK;
-        v += qv[lane] * prow[lane] + qv[lane + 32] * prow[lane + 32];
+  {
+    const int kq = lane >> 3, sub = lane & 7;          // 4 keys per warp per round, 8 lanes per key, 8 dims per lane
+    const float4 qu0 = *reinterpret_cast<const float4*>(qu + sub * 8), qu1 = *reinterpret_cast<const float4*>(qu + sub * 8 + 4);
+    const float4 qv0 = *reinterpret_cast<const float4*>(qv + sub * 8), qv1 = *reinterpret_cast<const float4*>(qv + sub * 8 + 4);
+    for (int base = warp * 4; base < NK; base += wpb * 4) {
+      const int j = base + kq;
+      const bool valid = (j < NK) && (a.mask[t * NK + j] == 0);
+      float v = 0.f;
+      if (valid) {
+        const float* krow = ((j < CACHE) ? kvK + ring_slot(head_ring, j) * D : a.qkv + (j - CACHE) * 3 * D + D) + h * DK + sub * 8;
+        const float4 k0 = *reinterpret_cast<const float4*>(krow), k1 = *reinterpret_cast<const float4*>(krow + 4);
+        v = qu0.x * k0.x + qu0.y * k0.y + qu0.z * k0.z + qu0.w * k0.w + qu1.x * k1.x + qu1.y * k1.y + qu1.z * k1.z + qu1.w * k1.w;
+        const int pi = a.pidx[t * NK + j];
+        if (pi >= 0) {
+          const float* prow = P.p + ((size_t)h * a.npos + pi) * DK + sub * 8;
+          const float4 p0 = *reinterpret_cast<const float4*>(prow), p1 = *reinterpret_cast<const float4*>(prow + 4);
+          v += qv0.x * p0.x + qv0.y * p0.y + qv0.z * p0.z + qv0.w * p0.w + qv1.x * p1.x + qv1.y * p1.y + qv1.z * p1.z + qv1.w * p1.w;
+        }
       }
-      s = warp_sum(v) * a.att_scale;
+      v += __shfl_xor_sync(0xffffffffu, v, 4);
+      v += __shfl_xor_sync(0xffffffffu, v, 2);
+      v += __shfl_xor_sync(0xffffffffu, v, 1);
+      if (sub == 0 && j < NK) sc[j] = valid ? v * a.att_scale : NEG_INF;
     }
-    if (lane == 0) sc[j] = s;
   }
   __syncthreads();
   if (warp == 0) {
@@ -223,13 +267,10 @@ __device__ void attention_block(const MKArgs& a, const LayerParams& P, const flo
   __syncthreads();
   const int d = threadIdx.x % DK, g = threadIdx.x / DK, G = blockDim.x / DK;
   float o = 0.f;
-  for (int j = g; j < NK; j += G) {
-    const float w = sc[j];
-    if (w != 0.f) {
-      const float* vrow = (j < CACHE) ? kvV + ring_slot(head_ring, j) * D + h * DK
-                                      : a.qkv + (j - CACHE) * 3 * D + 2 * D + h * DK;
-      o += w * vrow[d];
-    }
+#pragma unroll 4
+  for (int j = g; j < NK; j += G) {                    // branch-free: masked keys have weight 0
+    const float* vrow = ((j < CACHE) ? kvV + ring_slot(head_ring, j) * D : a.qkv + (j - CACHE) * 3 * D + 2 * D) + h * DK;
+    o += sc[j] * vrow[d];
   }
   part[g * DK + d] = o;
   __syncthreads();
@@ -257,6 +298,8 @@ extern "C" __global__ void __launch_bounds__(512) mk_kernel(MKArgs a) {
   float acc[TMAX];
 
   STAMP(0);
+  const bool do_prefetch = (a.flags & 1) != 0, fuse_ln = (a.flags & 2) != 0;
+  if (do_prefetch) prefetch_layer(a.layers[0], gtid, nthreads);
   for (int i = gtid; i < T * D; i += nthreads) a.resid0[i] = a.x_in[i];
   grid.sync(); STAMP(1);
   float* resid = a.resid0;
@@ -269,8 +312,17 @@ extern "C" __global__ void __launch_bounds__(512) mk_kernel(MKArgs a) {
     float* cc = a.conv_cache + (size_t)l * D * KC;
     const int ts = 2 + l * NSTAGE;
 
-    // S1: LN_ff1 + FFN1 up + SiLU
-    block_load(resid, T, D, P.ln_ff1_g, P.ln_ff1_b, a.eps, 0, xs, red);
+    if (do_prefetch && l + 1 < a.n_layers) prefetch_layer(a.layers[l + 1], gtid, nthreads);
+
+    // S1: [LN_out of the previous layer, if fused] + LN_ff1 + FFN1 up + SiLU
+    if (fuse_ln && l > 0) {
+      block_load(resid, T, D, a.layers[l - 1].ln_out_g, a.layers[l - 1].ln_out_b, a.eps, 0, xs, red);
+      for (int i = gtid; i < T * D; i += nthreads) resid_next[i] = xs[i];   // this layer's residual input
+      block_ln_inplace(xs, T, D, P.ln_ff1_g, P.ln_ff1_b, a.eps, 0, red);
+      float* tmp = resid; resid = resid_next; resid_next = tmp;              // S2.. read/update the new residual
+    } else {
+      block_load(resid, T, D, P.ln_ff1_g, P.ln_ff1_b, a.eps, 0, xs, red);
+    }
     for (int r = gwarp; r < DFF; r += nwarps) {
       row_dot(P.w_ff1_1 + (size_t)r * D, D, xs, T, lane, acc);
       if (lane == 0) { const float bb = P.b_ff1_1[r]; for (int t = 0; t < T; ++t) a.hbuf[t * DFF + r] = silu(acc[t] + bb); }
@@ -358,14 +410,20 @@ extern "C" __global__ void __launch_bounds__(512) mk_kernel(MKArgs a) {
     }
     grid.sync(); STAMP(ts + 8);
 
-    // S10: LN_out -> next residual (ping-pong: other blocks may still be reading resid for their statistics)
-    block_load(resid, T, D, P.ln_out_g, P.ln_out_b, a.eps, 0, xs, red);
-    for (int i = gtid; i < T * D; i += nthreads) resid_next[i] = xs[i];
-    grid.sync(); STAMP(ts + 9);
-    float* tmp = resid; resid = resid_next; resid_next = tmp;
+    // S10: LN_out -> next residual (ping-pong: other blocks may still be reading resid for their statistics).
+    // When fused, the next layer's S1 applies it instead; only the last layer still runs it (into x_out).
+    if (!fuse_ln || l + 1 == a.n_layers) {
+      block_load(resid, T, D, P.ln_out_g, P.ln_out_b, a.eps, 0, xs, red);
+      float* dst = (fuse_ln) ? a.x_out : resid_next;
+      for (int i = gtid; i < T * D; i += nthreads) dst[i] = xs[i];
+      grid.sync();
+      if (!fuse_ln) { float* tmp = resid; resid = resid_next; resid_next = tmp; }
+    }
+    STAMP(ts + 9);
   }
 
-  for (int i = gtid; i < T * D; i += nthreads) a.x_out[i] = resid[i];
+  if (!fuse_ln)
+    for (int i = gtid; i < T * D; i += nthreads) a.x_out[i] = resid[i];
   if (gtid == 0) *a.ring_head = (head_ring + T) % CACHE;
   STAMP(2 + a.n_layers * NSTAGE);
 }

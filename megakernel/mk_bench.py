@@ -98,8 +98,8 @@ class NemoGraph:
         self.g.replay()
 
 
-def make_mk(model, consts, threads, blocks, timers, xs, xlen, drop):
-    mk = MegakernelEncoder(model, consts, threads=threads, blocks=blocks, timers=timers)
+def make_mk(model, consts, threads, blocks, timers, xs, xlen, drop, flags=3):
+    mk = MegakernelEncoder(model, consts, threads=threads, blocks=blocks, timers=timers, flags=flags)
     c, t, cl = nemo_initial(model, "cuda")
     for x in xs[:40]:
         _, c, t, cl = nemo_step(model, x, xlen, c, t, cl, drop)
@@ -118,6 +118,8 @@ def main():
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--stages", action="store_true")
     ap.add_argument("--paced", action="store_true")
+    ap.add_argument("--flags", type=int, default=3, help="bit0 L2 prefetch, bit1 fused LN_out")
+    ap.add_argument("--ablation", action="store_true", help="layers-only latency for flags 0,1,2,3")
     ap.add_argument("--out", default="results")
     args = ap.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -162,15 +164,28 @@ def main():
                 if k * n_sm <= probe.max_blocks:
                     configs.append((th, k * n_sm))
             del probe
+    if args.ablation:
+        names = {0: "baseline v3 (no prefetch, LN_out separate)", 1: "+ L2 prefetch", 2: "+ fused LN_out", 3: "+ both"}
+        th, bl = configs[0]
+        for fl in (0, 1, 2, 3):
+            mk = make_mk(model, consts, th, bl, False, xs, xlen, drop, flags=fl)
+            for _ in range(30):
+                mk.layers_step()
+            r = time_fn(lambda: mk.layers_step(), args.iters)
+            print(f"[abl] flags {fl}  {names[fl]:44s} layers wall p50 {r['wall_us']['p50']:7.0f} us  gpu p50 {r['gpu_us']['p50']:7.0f}")
+            record({"kind": "mk_ablation", "flags": fl, "threads": th, "blocks": bl, **r})
+            del mk
+            torch.cuda.empty_cache()
+
     for th, bl in configs:
-        mk = make_mk(model, consts, th, bl, False, xs, xlen, drop)
+        mk = make_mk(model, consts, th, bl, False, xs, xlen, drop, flags=args.flags)
         for _ in range(30):
             mk.layers_step()
         rl = time_fn(lambda: mk.layers_step(), args.iters)
         bw = weight_bytes / rl["gpu_us"]["p50"] / 1e3
-        print(f"[mk ] layers  grid {bl:4d} x {th:3d}   wall p50 {rl['wall_us']['p50']:7.0f} us  p99 {rl['wall_us']['p99']:7.0f}"
+        print(f"[mk ] layers  grid {bl:4d} x {th:3d} f{args.flags}   wall p50 {rl['wall_us']['p50']:7.0f} us  p99 {rl['wall_us']['p99']:7.0f}"
               f"  gpu p50 {rl['gpu_us']['p50']:7.0f}  eff {bw:5.0f} GB/s")
-        record({"kind": "mk_layers", "threads": th, "blocks": bl, "eff_weight_gbs": bw, **rl})
+        record({"kind": "mk_layers", "threads": th, "blocks": bl, "flags": args.flags, "eff_weight_gbs": bw, **rl})
         pe = PreEncodeGraph(mk, xlen, drop, geo["feat"], geo["T_in"])
 
         def full_step():
@@ -182,7 +197,7 @@ def main():
         rp = time_fn(pe, args.iters)
         print(f"[mk ] step    grid {bl:4d} x {th:3d}   wall p50 {rs['wall_us']['p50']:7.0f} us  p99 {rs['wall_us']['p99']:7.0f}"
               f"   (pre-encode graph alone {rp['wall_us']['p50']:.0f} us)")
-        record({"kind": "mk_step", "threads": th, "blocks": bl, "pre_encode": rp, **rs})
+        record({"kind": "mk_step", "threads": th, "blocks": bl, "flags": args.flags, "pre_encode": rp, **rs})
         if args.paced and (th, bl) == configs[0]:
             rsp = time_fn(full_step, 150, paced_ms=160)
             print(f"[mk ] paced                       wall p50 {rsp['wall_us']['p50']:7.0f} us  p99 {rsp['wall_us']['p99']:7.0f}")
@@ -192,7 +207,7 @@ def main():
 
     if args.stages:
         th, bl = configs[0]
-        mk = make_mk(model, consts, th, bl, True, xs, xlen, drop)
+        mk = make_mk(model, consts, th, bl, True, xs, xlen, drop, flags=args.flags)
         per = [[] for _ in range(NSTAGE)]
         first = []
         for i in range(200):
@@ -214,7 +229,7 @@ def main():
             print(f"      {STAGE_NAMES[s]:24s} {m:7.2f} us   {gbs:6.0f} GB/s")
         tot = sum(r["median_us"] for r in rows) * mk.nl
         print(f"      sum x {mk.nl} layers = {tot:.0f} us")
-        record({"kind": "mk_stages", "threads": th, "blocks": bl, "stages": rows, "sum_us": tot})
+        record({"kind": "mk_stages", "threads": th, "blocks": bl, "flags": args.flags, "stages": rows, "sum_us": tot})
     resf.close()
 
 
