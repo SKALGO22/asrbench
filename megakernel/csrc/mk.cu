@@ -1,4 +1,4 @@
-// Megakernel v7 (v6.2 + persistent mode: resident kernel driven by a zero-copy mailbox; masks synthesised from cache_len): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
+// Megakernel v7.1 (v7 with the mailbox read by one thread only and relayed through device memory): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
 //
 // Stages per layer (each separated by a grid-wide barrier, 10 per layer):
 //   S1  LN_ff1(resid) -> FFN1 up (512->2048) + SiLU                -> h
@@ -62,7 +62,7 @@ struct MKArgs {
   float* x_out;               // [T, D]
   float* kv;                  // [L, 2, CACHE, D] projected K/V ring
   float* conv_cache;          // [L, D, KC]
-  int* ring_head;             // [1]
+  int* ring_head;             // [4]: ring head, then the persistent command relay {seq, cmd, cache_len}
   const uint8_t* mask;        // [T, CACHE+T]  1 = masked (NeMo semantics)
   const int* pidx;            // [T, CACHE+T]  index into p, -1 = zero (rel_shift padding)
   float* resid0;              // [T, D]
@@ -513,7 +513,7 @@ __device__ __forceinline__ void gemv_rows(const half* __restrict__ W, int N, con
 }
 
 template <int TT>
-__device__ __forceinline__ void mk_body(const MKArgs& a) {
+__device__ __forceinline__ void mk_body(const MKArgs& a, const int cache_len) {
   cg::grid_group grid = cg::this_grid();
   extern __shared__ float smem[];
   float* xs = smem;                           // TMAX*DFF floats
@@ -531,7 +531,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
 
   STAMP(0);
   {
-    const int NK = CACHE + T, invalid = CACHE - min(a.cache_len, CACHE);   // oldest slots not yet filled
+    const int NK = CACHE + T, invalid = CACHE - min(cache_len, CACHE);     // oldest slots not yet filled
     for (int i = threadIdx.x; i < T * NK; i += blockDim.x) {
       const bool masked = a.mask ? (a.mask[i] != 0) : ((i % NK) < invalid);
       mp[i] = masked ? MASKED : a.pidx[i];
@@ -701,25 +701,33 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
   STAMP(2 + a.n_layers * NSTAGE);
 }
 
-// Persistent mode (flag bit4): launched once, stays resident. Block 0 polls a mailbox in mapped (zero-copy) host
-// memory; every other block waits in grid.sync(), so all SMs stay busy and clocks stay up between chunks.
-// Host protocol: write x_in, cache_len, then seq += 1; kernel runs the step and sets done = seq. cmd == 2 -> exit.
+// Persistent mode (flag bit4): launched once, stays resident. Thread 0 of block 0 polls a mailbox in mapped
+// (zero-copy) host memory and copies the command into device memory (ring_head[1..3]); every other block waits in
+// grid.sync(), so all SMs stay busy and clocks stay up between chunks. Only that one thread ever reads host memory:
+// v7 let all 21.5k threads read the mailbox over PCIe after each barrier, which cost ~1 ms per chunk.
+// Host protocol: write x_in, cache_len, cmd, then seq += 1; the kernel runs the step and sets done = seq.
 template <int TT>
-__device__ void mk_persistent(MKArgs a) {
+__device__ void mk_persistent(const MKArgs& a) {
   cg::grid_group grid = cg::this_grid();
-  volatile int* mb = a.mbox;
+  volatile int* mb = a.mbox;                        // host memory: {seq, cmd, done, cache_len}
+  volatile int* cmdv = a.ring_head + 1;             // device memory: {seq, cmd, cache_len}
+  __shared__ int s_cmd[3];
   int last = 0;
   while (true) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-      while (mb[0] == last) { }
+      int sq;
+      while ((sq = mb[0]) == last) { }
       __threadfence_system();
+      cmdv[0] = sq; cmdv[1] = mb[1]; cmdv[2] = mb[3];
+      __threadfence();
     }
     grid.sync();
-    const int seq = mb[0];
-    if (mb[1] == 2) break;
+    if (threadIdx.x == 0) { s_cmd[0] = cmdv[0]; s_cmd[1] = cmdv[1]; s_cmd[2] = cmdv[2]; }
+    __syncthreads();
+    const int seq = s_cmd[0], cmd = s_cmd[1], cl = s_cmd[2];
+    if (cmd == 2) break;
     last = seq;
-    a.cache_len = mb[3];
-    mk_body<TT>(a);
+    mk_body<TT>(a, cl);
     grid.sync();                                    // all output and state writes done
     if (blockIdx.x == 0 && threadIdx.x == 0) {
       __threadfence_system();
@@ -731,7 +739,7 @@ __device__ void mk_persistent(MKArgs a) {
 template <int TT>
 __device__ __forceinline__ void mk_entry(const MKArgs& a) {
   if (a.flags & 16) mk_persistent<TT>(a);
-  else mk_body<TT>(a);
+  else mk_body<TT>(a, a.cache_len);
 }
 
 extern "C" __global__ void __launch_bounds__(256) mk_kernel_t1(MKArgs a) { mk_entry<1>(a); }

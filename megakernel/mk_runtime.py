@@ -242,7 +242,7 @@ class MKState:
     def __init__(self, n_layers, device="cuda"):
         self.kv = torch.zeros(n_layers, 2, CACHE, D, dtype=torch.float32, device=device)
         self.conv = torch.zeros(n_layers, D, KC, dtype=torch.float32, device=device)
-        self.head = torch.zeros(1, dtype=torch.int32, device=device)
+        self.head = torch.zeros(4, dtype=torch.int32, device=device)   # [0] ring head, [1..3] persistent relay
         self.cache_len = 0
 
     @torch.inference_mode()
@@ -366,9 +366,9 @@ class MegakernelEncoder:
         if x is None:
             x = self.x_in
         if not self.use_kernel:
-            head = int(self.state.head.item())
+            head = int(self.state.head[0].item())
             out = reference_layers(self.layers, x, self.state.kv, self.state.conv, head, mask, self.pidx, self.sc)
-            self.state.head.fill_((head + self.T) % CACHE)
+            self.state.head[0] = (head + self.T) % CACHE
             self.state.cache_len += self.T
             self.x_out.copy_(out)
             return self.x_out

@@ -110,7 +110,7 @@ def main():
     if not args.layers:
       with torch.inference_mode():
         conv_r = rel(mk.state.conv.permute(0, 1, 2), t[:, 0].float())[0]
-        head = int(mk.state.head.item())
+        head = int(mk.state.head[0].item())
         order = [(head + j) % CACHE for j in range(CACHE)]
         a0 = model.encoder.layers[0].self_attn
         k_ref = a0.linear_k(c[0, 0]).float()

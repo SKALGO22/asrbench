@@ -14,7 +14,8 @@
 | v6 | split-K attention over up to 4 blocks per (head, query), partials merged in S5's load | A6000: correct; attention 13.3 → 6.1 µs but S5 3.1 → 7.2 µs (merge load 5 µs: serialized L2 reads); net layers 1.187 ms, unchanged |
 | v6.1 | merge loads all partials before any math; flag 8 = adjacent rows per warp | A6000: correct (both mappings). Ablation (layers): flags 0 1.134 ms (best), fused LN_out 1.218, adjacent rows 1.237, both 1.294. Fused LN_out now hurts (its second LayerNorm is the unvectorised path) and adjacent rows hurt (strided rows spread the DRAM traffic and keep all 672 warps busy). S5 merge 7.2 → 6.1 µs. Best step ≈ 1.28 ms = 1.79x vs NeMo CUDA Graph. Default flags 0 |
 | v6.2 | every load a stage needs is issued up front (epilogue operands, gamma/beta, masks in shared memory); 512-row stages 1 row per warp | A6000: correct; layers 0.953 ms (flags 0) / 0.925 ms (flags 2, best); step ≈1.07 ms = 2.15x vs NeMo CUDA Graph (2.30), 1.86x vs B (1.99); paced 1.36 vs 2.59 ms. Most stages within ~1 µs of the latency-bandwidth model; remaining gaps: attention+merge (~5 µs/layer), S1 (~2 µs). Default flags 2 |
-| v7 | persistent mode (flag 16): launched once, block 0 polls a mailbox in zero-copy host memory, other blocks wait in grid.sync; attention mask synthesised in-kernel from cache_len (verified equal to NeMo's masks for every cache length); `mk_persist.py` compares launch-per-chunk vs persistent (latency b2b and paced, power, SM clock) | run `mk_persist.py` |
+| v7 | persistent mode (flag 16): resident kernel, mailbox in zero-copy host memory; masks synthesised in-kernel from cache_len | A6000: outputs identical to launch mode (max diff 0) but 2.1x slower (b2b 1949 vs 929 µs): after each barrier all 21.5k threads read the mailbox over PCIe. Idle: 107 W (no kernel) vs 122 W (resident). Launch per chunk, zero-copy: b2b 929 µs, paced p50 1065 / p99 1155 µs, SM clock min 1800 MHz. cudnn.benchmark: no effect on pre-encode (146 µs) |
+| v7.1 | only thread 0 of block 0 reads the mailbox; it relays {seq, cmd, cache_len} through device memory | expected: persistent b2b ≈ launch minus launch/sync overhead; paced ≈ b2b |
 
 v1 (this folder) runs all 17 layers of `parakeet_realtime_eou_120m` for one 160 ms chunk in **one cooperative
 launch**: 142 thread blocks (one per SM on an L40S) stay alive for the whole chunk and hand work to each other through
@@ -95,7 +96,8 @@ Per layer, 10 stages separated by `grid.sync()` (170 per chunk):
 | v6 | split-K attention merged into S5's load | done: attention fixed, merge too slow |
 | v6.1 | one-round-trip merge + adjacent-row option | done: flags 0 best; adjacent rows and fused LN_out refuted on A6000 |
 | v6.2 | all loads of a stage issued up front | done: layers 0.925 ms, 2.15x vs NeMo CUDA Graph |
-| v7 | persistent kernel + zero-copy mailbox (this folder) | does residency remove the paced penalty, and at what idle power? |
+| v7 | persistent kernel + zero-copy mailbox | done: correct, but PCIe mailbox reads by every thread made it 2x slower |
+| v7.1 | single-thread mailbox relay (this folder) | does residency remove the paced penalty, and at what idle power? |
 | v2 | fewer barriers: fuse S10 into the next S1, S5's commit into S6, LN stats reuse | latency vs number of barriers (170 → ~120) |
 | v3 | counters instead of `grid.sync`: a warp waits only for the rows it needs (e.g. S2 rows wait for S1) | barrier cost vs dependency-wait cost |
 | v4 | prefetch next stage's weights into shared memory with `cp.async` during the barrier | achieved bandwidth per stage |
