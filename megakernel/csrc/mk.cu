@@ -1,4 +1,4 @@
-// Megakernel v4 (v3 + register prefetch of the next stage's weight rows before every barrier): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
+// Megakernel v4.1 (v4 + per-stage phase timers: input load / compute / barrier): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
 //
 // Stages per layer (each separated by a grid-wide barrier, 10 per layer):
 //   S1  LN_ff1(resid) -> FFN1 up (512->2048) + SiLU                -> h
@@ -70,6 +70,7 @@ struct MKArgs {
   float* att;                 // [T, D]
   float* ybuf;                // [T, D]
   unsigned long long* timers; // [n_layers*NSTAGE + 3] or nullptr (block 0 records %globaltimer)
+  unsigned long long* ptimers;// [n_layers*NSTAGE*2] or nullptr: block 0 stamps after its input load and after its compute
   int n_layers;
   int T;
   int npos;
@@ -283,6 +284,7 @@ __device__ void attention_block(const MKArgs& a, const LayerParams& P, const flo
 }
 
 #define STAMP(idx) do { if (a.timers && blockIdx.x == 0 && threadIdx.x == 0) a.timers[(idx)] = gtimer(); } while (0)
+#define PSTAMP(stage, k) do { if (a.ptimers && blockIdx.x == 0 && threadIdx.x == 0) a.ptimers[((l) * NSTAGE + (stage)) * 2 + (k)] = gtimer(); } while (0)
 
 // ------------------------------------------------------------------------------------------- register prefetch
 // Each warp knows, before a barrier, which weight rows it will need in the NEXT stage (weights do not depend on
@@ -405,35 +407,44 @@ extern "C" __global__ void __launch_bounds__(512) mk_kernel(MKArgs a) {
     } else {
       block_load(resid, T, D, P.ln_ff1_g, P.ln_ff1_b, a.eps, 0, xs, red);
     }
+    PSTAMP(0, 0);
     gemv_pre<2, 0>(P.w_ff1_1, DFF, D, xs, T, gwarp, nwarps, lane, pre, regpf, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_ff1_1[r]; for (int t = 0; t < T; ++t) a.hbuf[t * DFF + r] = silu(acc[t] + bb); }
     });
+    PSTAMP(0, 1);
     if (regpf) prefetch_t<8, 0>(P.w_ff1_2, D, DFF, gwarp, nwarps, lane, pre);
     grid.sync(); STAMP(ts + 0);
 
     // S2: FFN1 down; resid += fc * out
     block_load(a.hbuf, T, DFF, nullptr, nullptr, a.eps, 0, xs, red);
+    PSTAMP(1, 0);
     gemv_pre<8, 0>(P.w_ff1_2, D, DFF, xs, T, gwarp, nwarps, lane, pre, regpf, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_ff1_2[r]; for (int t = 0; t < T; ++t) resid[t * D + r] += a.fc_factor * (acc[t] + bb); }
     });
+    PSTAMP(1, 1);
     if (regpf) prefetch_t<2, 0>(P.w_qkv, 3 * D, D, gwarp, nwarps, lane, pre);
     grid.sync(); STAMP(ts + 1);
 
     // S3: LN_att + Q|K|V
     block_load(resid, T, D, P.ln_att_g, P.ln_att_b, a.eps, 0, xs, red);
+    PSTAMP(2, 0);
     gemv_pre<2, 0>(P.w_qkv, 3 * D, D, xs, T, gwarp, nwarps, lane, pre, regpf, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_qkv[r]; for (int t = 0; t < T; ++t) a.qkv[t * 3 * D + r] = acc[t] + bb; }
     });
+    PSTAMP(2, 1);
     if (regpf) prefetch_t<2, 0>(P.w_o, D, D, gwarp, nwarps, lane, pre);     // held through the attention stage
     grid.sync(); STAMP(ts + 2);
 
     // S4: attention core
+    PSTAMP(3, 0);
     for (int it = blockIdx.x; it < NH * T; it += gridDim.x)
       attention_block(a, P, kvK, kvV, head_ring, it / T, it % T, attw);
+    PSTAMP(3, 1);
     grid.sync(); STAMP(ts + 3);
 
     // S5: output projection; resid += out; commit new K/V into the oldest ring slots
     block_load(a.att, T, D, nullptr, nullptr, a.eps, 0, xs, red);
+    PSTAMP(4, 0);
     gemv_pre<2, 0>(P.w_o, D, D, xs, T, gwarp, nwarps, lane, pre, regpf, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_o[r]; for (int t = 0; t < T; ++t) resid[t * D + r] += acc[t] + bb; }
     });
@@ -442,11 +453,13 @@ extern "C" __global__ void __launch_bounds__(512) mk_kernel(MKArgs a) {
       kvK[slot * D + d] = a.qkv[t * 3 * D + D + d];
       kvV[slot * D + d] = a.qkv[t * 3 * D + 2 * D + d];
     }
+    PSTAMP(4, 1);
     if (regpf) prefetch_t<2, 1>(P.w_pw1, D, D, gwarp, nwarps, lane, pre);
     grid.sync(); STAMP(ts + 4);
 
     // S6: conv module part 1 (per-channel, owned by one warp): PW1 rows c and c+D, GLU, causal DW conv
     block_load(resid, T, D, P.ln_conv_g, P.ln_conv_b, a.eps, 0, xs, red);
+    PSTAMP(5, 0);
     gemv_pre<2, 1>(P.w_pw1, D, D, xs, T, gwarp, nwarps, lane, pre, regpf, [&](int c, float* ga, float* gb) {
       if (lane == 0) {
         float hist[KC + TMAX];
@@ -463,30 +476,37 @@ extern "C" __global__ void __launch_bounds__(512) mk_kernel(MKArgs a) {
         for (int j = 0; j < KC; ++j) cc[c * KC + j] = hist[T + j];      // last KC of [cache | new]
       }
     });
+    PSTAMP(5, 1);
     if (regpf) prefetch_t<2, 0>(P.w_pw2, D, D, gwarp, nwarps, lane, pre);
     grid.sync(); STAMP(ts + 5);
 
     // S7: conv module part 2: LN_cn(y) + SiLU -> PW2; resid += out
     block_load(a.ybuf, T, D, P.ln_cn_g, P.ln_cn_b, a.eps, 1, xs, red);
+    PSTAMP(6, 0);
     gemv_pre<2, 0>(P.w_pw2, D, D, xs, T, gwarp, nwarps, lane, pre, regpf, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_pw2[r]; for (int t = 0; t < T; ++t) resid[t * D + r] += acc[t] + bb; }
     });
+    PSTAMP(6, 1);
     if (regpf) prefetch_t<2, 0>(P.w_ff2_1, DFF, D, gwarp, nwarps, lane, pre);
     grid.sync(); STAMP(ts + 6);
 
     // S8: LN_ff2 + FFN2 up + SiLU
     block_load(resid, T, D, P.ln_ff2_g, P.ln_ff2_b, a.eps, 0, xs, red);
+    PSTAMP(7, 0);
     gemv_pre<2, 0>(P.w_ff2_1, DFF, D, xs, T, gwarp, nwarps, lane, pre, regpf, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_ff2_1[r]; for (int t = 0; t < T; ++t) a.hbuf[t * DFF + r] = silu(acc[t] + bb); }
     });
+    PSTAMP(7, 1);
     if (regpf) prefetch_t<8, 0>(P.w_ff2_2, D, DFF, gwarp, nwarps, lane, pre);
     grid.sync(); STAMP(ts + 7);
 
     // S9: FFN2 down; resid += fc * out
     block_load(a.hbuf, T, DFF, nullptr, nullptr, a.eps, 0, xs, red);
+    PSTAMP(8, 0);
     gemv_pre<8, 0>(P.w_ff2_2, D, DFF, xs, T, gwarp, nwarps, lane, pre, regpf, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_ff2_2[r]; for (int t = 0; t < T; ++t) resid[t * D + r] += a.fc_factor * (acc[t] + bb); }
     });
+    PSTAMP(8, 1);
     if (regpf && l + 1 < a.n_layers) prefetch_t<2, 0>(a.layers[l + 1].w_ff1_1, DFF, D, gwarp, nwarps, lane, pre);
     grid.sync(); STAMP(ts + 8);
 

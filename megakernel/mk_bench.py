@@ -100,7 +100,7 @@ class NemoGraph:
         self.g.replay()
 
 
-def make_mk(model, consts, threads, blocks, timers, xs, xlen, drop, flags=6):
+def make_mk(model, consts, threads, blocks, timers, xs, xlen, drop, flags=2):
     mk = MegakernelEncoder(model, consts, threads=threads, blocks=blocks, timers=timers, flags=flags)
     c, t, cl = nemo_initial(model, "cuda")
     for x in xs[:40]:
@@ -120,7 +120,7 @@ def main():
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--stages", action="store_true")
     ap.add_argument("--paced", action="store_true")
-    ap.add_argument("--flags", type=int, default=6, help="bit0 L2 prefetch, bit1 fused LN_out, bit2 register prefetch")
+    ap.add_argument("--flags", type=int, default=2, help="bit0 L2 prefetch, bit1 fused LN_out, bit2 register prefetch")
     ap.add_argument("--ablation", action="store_true", help="layers-only latency for flag combinations 0,1,2,4,6,7")
     ap.add_argument("--out", default="results")
     args = ap.parse_args()
@@ -212,26 +212,38 @@ def main():
         th, bl = configs[0]
         mk = make_mk(model, consts, th, bl, True, xs, xlen, drop, flags=args.flags)
         per = [[] for _ in range(NSTAGE)]
+        ph = [[[], [], []] for _ in range(NSTAGE - 1)]
         first = []
         for i in range(200):
             mk.layers_step()
             torch.cuda.synchronize()
             d = mk.stage_times_us()
+            pp = mk.stage_phases_us()
             if i < 20:
                 continue
             first.append(d[0])
             for l in range(mk.nl):
                 for s in range(NSTAGE):
                     per[s].append(d[1 + l * NSTAGE + s])
+                for s in range(NSTAGE - 1):
+                    for k in range(3):
+                        ph[s][k].append(pp[l][s][k])
         print(f"[mk ] per-stage (median over layers x chunks), input copy {statistics.median(first):.2f} us")
+        print(f"      {'stage':24s} {'total':>8s} {'GB/s':>6s} | block 0: {'load':>6s} {'compute':>8s} {'barrier':>8s}")
         rows = []
         for s in range(NSTAGE):
             m = statistics.median(per[s])
             gbs = STAGE_WEIGHT_BYTES[s] / m / 1e3 if STAGE_WEIGHT_BYTES[s] else 0.0
-            rows.append({"stage": STAGE_NAMES[s], "median_us": m, "weight_bytes": STAGE_WEIGHT_BYTES[s], "gbs": gbs})
-            print(f"      {STAGE_NAMES[s]:24s} {m:7.2f} us   {gbs:6.0f} GB/s")
+            r = {"stage": STAGE_NAMES[s], "median_us": m, "weight_bytes": STAGE_WEIGHT_BYTES[s], "gbs": gbs}
+            extra = ""
+            if s < NSTAGE - 1:
+                lo, co, ba = (statistics.median(ph[s][k]) for k in range(3))
+                r.update(load_us=lo, compute_us=co, barrier_us=ba)
+                extra = f" | {lo:15.2f} {co:8.2f} {ba:8.2f}"
+            rows.append(r)
+            print(f"      {STAGE_NAMES[s]:24s} {m:8.2f} {gbs:6.0f}{extra}")
         tot = sum(r["median_us"] for r in rows) * mk.nl
-        print(f"      sum x {mk.nl} layers = {tot:.0f} us")
+        print(f"      sum x {mk.nl} layers = {tot:.0f} us   (barrier column = waiting for the slowest block + grid.sync + next-stage prefetch)")
         record({"kind": "mk_stages", "threads": th, "blocks": bl, "flags": args.flags, "stages": rows, "sum_us": tot})
     resf.close()
 

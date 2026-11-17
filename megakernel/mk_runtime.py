@@ -57,7 +57,7 @@ def build_lib(force: bool = False) -> Path:
 class MKArgs(ctypes.Structure):
     _fields_ = [(n, ctypes.c_void_p) for n in
                 ["layers", "x_in", "x_out", "kv", "conv_cache", "ring_head", "mask", "pidx", "resid0", "resid1",
-                 "hbuf", "qkv", "att", "ybuf", "timers"]] + \
+                 "hbuf", "qkv", "att", "ybuf", "timers", "ptimers"]] + \
                [("n_layers", ctypes.c_int), ("T", ctypes.c_int), ("npos", ctypes.c_int), ("flags", ctypes.c_int),
                 ("eps", ctypes.c_float), ("fc_factor", ctypes.c_float), ("att_scale", ctypes.c_float),
                 ("pad2_", ctypes.c_float)]
@@ -290,7 +290,7 @@ class MegakernelEncoder:
     """One streaming encoder step = NeMo pre-encode (subsampling + pos-enc scaling) + the megakernel for all layers."""
 
     def __init__(self, model, consts, threads: int = 256, blocks: Optional[int] = None, timers: bool = False,
-                 use_kernel: bool = True, device="cuda", wdtype=None, flags: int = 6):
+                 use_kernel: bool = True, device="cuda", wdtype=None, flags: int = 2):
         self.model, self.enc, self.consts = model, model.encoder, consts
         self.device = device
         self.T = consts["T"]
@@ -313,6 +313,7 @@ class MegakernelEncoder:
         self.bufs = {"resid0": z(T, D), "resid1": z(T, D), "hbuf": z(T, DFF), "qkv": z(T, 3 * D), "att": z(T, D),
                      "ybuf": z(T, D)}
         self.timers = torch.zeros(self.nl * NSTAGE + 3, dtype=torch.int64, device=device) if timers else None
+        self.ptimers = torch.zeros(self.nl * NSTAGE * 2, dtype=torch.int64, device=device) if timers else None
         if use_kernel:
             L = lib()
             check(L.mk_prepare(threads), "mk_prepare")
@@ -356,6 +357,7 @@ class MegakernelEncoder:
         for k, v in self.bufs.items():
             setattr(a, k, v.data_ptr())
         a.timers = self.timers.data_ptr() if self.timers is not None else None
+        a.ptimers = self.ptimers.data_ptr() if self.ptimers is not None else None
         a.n_layers, a.T, a.npos, a.flags = self.nl, self.T, self.npos, self.flags
         a.eps, a.fc_factor, a.att_scale = self.sc["eps"], self.sc["fc_factor"], self.sc["att_scale"]
         stream = torch.cuda.current_stream().cuda_stream
@@ -389,3 +391,20 @@ class MegakernelEncoder:
             return None
         t = self.timers.cpu().double()
         return ((t[1:] - t[:-1]) / 1e3).tolist()
+
+    def stage_phases_us(self):
+        """Per (layer, stage): (input load, compute, barrier+prefetch) in µs as seen by block 0 (S10 excluded)."""
+        if self.ptimers is None:
+            return None
+        t = self.timers.cpu().double()
+        p = self.ptimers.cpu().double().view(self.nl, NSTAGE, 2)
+        out = []
+        for l in range(self.nl):
+            row = []
+            for s in range(NSTAGE - 1):
+                start = t[1 + l * NSTAGE + s]           # end of the previous stage (or of the input copy)
+                end = t[2 + l * NSTAGE + s]
+                a0, a1 = p[l, s, 0], p[l, s, 1]
+                row.append(((a0 - start) / 1e3, (a1 - a0) / 1e3, (end - a1) / 1e3))
+            out.append(row)
+        return out
