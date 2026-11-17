@@ -68,6 +68,7 @@ class PreEncodeGraph:
         with torch.cuda.graph(self.g), torch.inference_mode():
             mk.x_in.copy_(mk.pre_encode(self.mel, xlen, drop))
 
+    @torch.inference_mode()
     def __call__(self, mel=None):
         if mel is not None:
             self.mel.copy_(mel)
@@ -94,6 +95,7 @@ class NemoGraph:
                 o, c, t, cl = nemo_step(model, self.x, xlen, self.c, self.t, self.cl, drop)
                 self.c.copy_(c); self.t.copy_(t); self.cl.copy_(cl)
 
+    @torch.inference_mode()
     def __call__(self):
         self.g.replay()
 

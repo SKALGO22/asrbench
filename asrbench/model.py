@@ -223,6 +223,7 @@ class CudaGraphStep(Step):
                 s.c.copy_(o[2]); s.t.copy_(o[3]); s.cl.copy_(o[4])
                 self.out = o[0]
 
+    @torch.inference_mode()
     def __call__(self):
         self.g.replay()
         return self.out
