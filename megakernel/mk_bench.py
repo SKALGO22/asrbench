@@ -100,7 +100,7 @@ class NemoGraph:
         self.g.replay()
 
 
-def make_mk(model, consts, threads, blocks, timers, xs, xlen, drop, flags=0):
+def make_mk(model, consts, threads, blocks, timers, xs, xlen, drop, flags=2):
     mk = MegakernelEncoder(model, consts, threads=threads, blocks=blocks, timers=timers, flags=flags)
     c, t, cl = nemo_initial(model, "cuda")
     for x in xs[:40]:
@@ -120,11 +120,15 @@ def main():
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--stages", action="store_true")
     ap.add_argument("--paced", action="store_true")
-    ap.add_argument("--flags", type=int, default=0, help="bit0 L2 prefetch, bit1 fused LN_out, bit3 adjacent rows per warp")
+    ap.add_argument("--flags", type=int, default=2, help="bit0 L2 prefetch, bit1 fused LN_out, bit3 adjacent rows per warp")
     ap.add_argument("--ablation", action="store_true", help="layers-only latency for flags 0,2,8")
+    ap.add_argument("--cudnn-bench", action="store_true", help="torch.backends.cudnn.benchmark = True (affects NeMo baseline and pre-encode)")
     ap.add_argument("--out", default="results")
     args = ap.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
+    if args.cudnn_bench:
+        torch.backends.cudnn.benchmark = True
+        print("[mk ] cudnn.benchmark = True")
     model = load(args.model, "cuda", args.fp32)
     consts = capture_constants(model)
     xs, xlen, drop = random_chunks(model, 41, "cuda", seed=3)
@@ -140,7 +144,7 @@ def main():
     weight_bytes = sum(p.numel() * p.element_size() for p in model.encoder.layers.parameters()) // (2 if args.fp32 else 1)
 
     def record(rec):
-        rec.update(gpu=gpu, precision=prec, ts=time.strftime("%Y-%m-%dT%H:%M:%S"))
+        rec.update(gpu=gpu, precision=prec, cudnn_benchmark=bool(args.cudnn_bench), ts=time.strftime("%Y-%m-%dT%H:%M:%S"))
         resf.write(json.dumps(rec) + "\n"); resf.flush()
 
     # baseline: NeMo CUDA Graph (full step)
@@ -167,7 +171,7 @@ def main():
                     configs.append((th, k * n_sm))
             del probe
     if args.ablation:
-        names = {0: "LN_out separate, strided rows (default)", 2: "fused LN_out", 8: "adjacent rows per warp"}
+        names = {0: "LN_out separate", 2: "fused LN_out (default)", 8: "adjacent rows per warp"}
         th, bl = configs[0]
         for fl in (0, 2, 8):
             mk = make_mk(model, consts, th, bl, False, xs, xlen, drop, flags=fl)

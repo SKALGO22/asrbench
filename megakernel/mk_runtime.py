@@ -57,8 +57,9 @@ def build_lib(force: bool = False) -> Path:
 class MKArgs(ctypes.Structure):
     _fields_ = [(n, ctypes.c_void_p) for n in
                 ["layers", "x_in", "x_out", "kv", "conv_cache", "ring_head", "mask", "pidx", "resid0", "resid1",
-                 "hbuf", "qkv", "att", "ybuf", "timers", "ptimers"]] + \
+                 "hbuf", "qkv", "att", "ybuf", "timers", "ptimers", "mbox"]] + \
                [("n_layers", ctypes.c_int), ("T", ctypes.c_int), ("npos", ctypes.c_int), ("flags", ctypes.c_int),
+                ("cache_len", ctypes.c_int), ("pad3_", ctypes.c_int),
                 ("eps", ctypes.c_float), ("fc_factor", ctypes.c_float), ("att_scale", ctypes.c_float),
                 ("pad2_", ctypes.c_float)]
 
@@ -72,6 +73,7 @@ def lib():
         torch.cuda.init()                       # loads PyTorch's libcudart first, so libmk reuses it
         _LIB = ctypes.CDLL(str(build_lib()))
         _LIB.mk_error_string.restype = ctypes.c_char_p
+        _LIB.mk_host_alloc.argtypes = [ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p)]
         assert _LIB.mk_args_size() == ctypes.sizeof(MKArgs), "MKArgs layout mismatch between C and Python"
         assert _LIB.mk_layer_params_size() == 8 * len(LAYER_FIELDS), "LayerParams layout mismatch"
     return _LIB
@@ -80,6 +82,27 @@ def lib():
 def check(err: int, what: str):
     if err != 0:
         raise RuntimeError(f"{what}: CUDA error {err}: {lib().mk_error_string(err).decode()}")
+
+
+class HostBuffer:
+    """Pinned + mapped (zero-copy) host memory: the CPU writes/reads `arr`, the GPU uses `dptr` directly."""
+
+    def __init__(self, n, ctype=ctypes.c_float):
+        import numpy as np
+        self.hptr, self.dptr = ctypes.c_void_p(), ctypes.c_void_p()
+        check(lib().mk_host_alloc(n * ctypes.sizeof(ctype), ctypes.byref(self.hptr), ctypes.byref(self.dptr)),
+              "mk_host_alloc")
+        self.raw = (ctype * n).from_address(self.hptr.value)
+        self.arr = np.ctypeslib.as_array(self.raw)
+
+    def free(self):
+        lib().mk_host_free(self.hptr)
+
+
+def make_stream():
+    s = ctypes.c_void_p()
+    check(lib().mk_stream_create(ctypes.byref(s)), "mk_stream_create")
+    return s
 
 
 # ============================================================================== NeMo streaming helpers
@@ -290,7 +313,7 @@ class MegakernelEncoder:
     """One streaming encoder step = NeMo pre-encode (subsampling + pos-enc scaling) + the megakernel for all layers."""
 
     def __init__(self, model, consts, threads: int = 256, blocks: Optional[int] = None, timers: bool = False,
-                 use_kernel: bool = True, device="cuda", wdtype=None, flags: int = 0):
+                 use_kernel: bool = True, device="cuda", wdtype=None, flags: int = 2):
         self.model, self.enc, self.consts = model, model.encoder, consts
         self.device = device
         self.T = consts["T"]
@@ -360,11 +383,30 @@ class MegakernelEncoder:
         a.timers = self.timers.data_ptr() if self.timers is not None else None
         a.ptimers = self.ptimers.data_ptr() if self.ptimers is not None else None
         a.n_layers, a.T, a.npos, a.flags = self.nl, self.T, self.npos, self.flags
+        a.cache_len = min(self.state.cache_len, CACHE)
+        a.mbox = None
         a.eps, a.fc_factor, a.att_scale = self.sc["eps"], self.sc["fc_factor"], self.sc["att_scale"]
         stream = torch.cuda.current_stream().cuda_stream
         check(lib().mk_launch(ctypes.byref(a), self.blocks, self.threads, ctypes.c_void_p(stream)), "mk_launch")
         self.state.cache_len += self.T
         return self.x_out
+
+    def launch_raw(self, x_in_ptr, x_out_ptr, stream, flags=None, mbox_ptr=None, cache_len=CACHE):
+        """Launch with caller-supplied input/output pointers (e.g. zero-copy host buffers) on `stream`.
+        flags | 16 starts the resident persistent kernel (returns immediately; drive it through the mailbox).
+        The attention mask is synthesised in-kernel from cache_len (mask = nullptr)."""
+        a = MKArgs()
+        a.layers = self.params.data_ptr(); a.x_in = x_in_ptr; a.x_out = x_out_ptr
+        a.kv = self.state.kv.data_ptr(); a.conv_cache = self.state.conv.data_ptr(); a.ring_head = self.state.head.data_ptr()
+        a.mask = None; a.pidx = self.pidx.data_ptr()
+        for k, v in self.bufs.items():
+            setattr(a, k, v.data_ptr())
+        a.timers = None; a.ptimers = None; a.mbox = mbox_ptr
+        a.n_layers, a.T, a.npos = self.nl, self.T, self.npos
+        a.flags = self.flags if flags is None else flags
+        a.cache_len = cache_len
+        a.eps, a.fc_factor, a.att_scale = self.sc["eps"], self.sc["fc_factor"], self.sc["att_scale"]
+        check(lib().mk_launch(ctypes.byref(a), self.blocks, self.threads, stream), "mk_launch")
 
     @torch.inference_mode()
     def pre_encode(self, mel: torch.Tensor, mel_len: torch.Tensor, drop: int) -> torch.Tensor:

@@ -1,4 +1,4 @@
-// Megakernel v6.2 (v6.1 + epilogue operands, LayerNorm gamma/beta and attention masks fetched up front): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
+// Megakernel v7 (v6.2 + persistent mode: resident kernel driven by a zero-copy mailbox; masks synthesised from cache_len): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
 //
 // Stages per layer (each separated by a grid-wide barrier, 10 per layer):
 //   S1  LN_ff1(resid) -> FFN1 up (512->2048) + SiLU                -> h
@@ -19,6 +19,7 @@
 #include <cuda_fp16.h>
 #include <cooperative_groups.h>
 #include <stdint.h>
+#include <string.h>
 
 namespace cg = cooperative_groups;
 
@@ -72,10 +73,13 @@ struct MKArgs {
   float* ybuf;                // [T, D]
   unsigned long long* timers; // [n_layers*NSTAGE + 3] or nullptr (block 0 records %globaltimer)
   unsigned long long* ptimers;// [n_layers*NSTAGE*2] or nullptr: block 0 stamps after its input load and after its compute
+  int* mbox;                  // persistent mode: mapped host memory {seq, cmd, done, cache_len}
   int n_layers;
   int T;
   int npos;
-  int flags;                  // bit0: L2-prefetch next layer, bit1: fuse LN_out into next S1, bit3: adjacent rows per warp
+  int flags;                  // bit0 L2-prefetch next layer, bit1 fused LN_out, bit3 adjacent rows, bit4 persistent
+  int cache_len;              // valid cached frames before this chunk (used when mask == nullptr)
+  int pad3_;
   float eps;
   float fc_factor;
   float att_scale;
@@ -526,7 +530,13 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
   const bool contig = (a.flags & 8) != 0;                                     // bit3: adjacent rows per warp
 
   STAMP(0);
-  for (int i = threadIdx.x; i < T * (CACHE + T); i += blockDim.x) mp[i] = a.mask[i] ? MASKED : a.pidx[i];
+  {
+    const int NK = CACHE + T, invalid = CACHE - min(a.cache_len, CACHE);   // oldest slots not yet filled
+    for (int i = threadIdx.x; i < T * NK; i += blockDim.x) {
+      const bool masked = a.mask ? (a.mask[i] != 0) : ((i % NK) < invalid);
+      mp[i] = masked ? MASKED : a.pidx[i];
+    }
+  }
   if (do_l2pf) prefetch_layer(a.layers[0], gtid, nthreads);
   for (int i = gtid; i < T * D; i += nthreads) a.resid0[i] = a.x_in[i];
   grid.sync(); STAMP(1);
@@ -691,10 +701,43 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
   STAMP(2 + a.n_layers * NSTAGE);
 }
 
-extern "C" __global__ void __launch_bounds__(256) mk_kernel_t1(MKArgs a) { mk_body<1>(a); }
-extern "C" __global__ void __launch_bounds__(256) mk_kernel_t2(MKArgs a) { mk_body<2>(a); }
-extern "C" __global__ void __launch_bounds__(256) mk_kernel_t3(MKArgs a) { mk_body<3>(a); }
-extern "C" __global__ void __launch_bounds__(256) mk_kernel_t4(MKArgs a) { mk_body<4>(a); }
+// Persistent mode (flag bit4): launched once, stays resident. Block 0 polls a mailbox in mapped (zero-copy) host
+// memory; every other block waits in grid.sync(), so all SMs stay busy and clocks stay up between chunks.
+// Host protocol: write x_in, cache_len, then seq += 1; kernel runs the step and sets done = seq. cmd == 2 -> exit.
+template <int TT>
+__device__ void mk_persistent(MKArgs a) {
+  cg::grid_group grid = cg::this_grid();
+  volatile int* mb = a.mbox;
+  int last = 0;
+  while (true) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      while (mb[0] == last) { }
+      __threadfence_system();
+    }
+    grid.sync();
+    const int seq = mb[0];
+    if (mb[1] == 2) break;
+    last = seq;
+    a.cache_len = mb[3];
+    mk_body<TT>(a);
+    grid.sync();                                    // all output and state writes done
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      __threadfence_system();
+      mb[2] = seq;
+    }
+  }
+}
+
+template <int TT>
+__device__ __forceinline__ void mk_entry(const MKArgs& a) {
+  if (a.flags & 16) mk_persistent<TT>(a);
+  else mk_body<TT>(a);
+}
+
+extern "C" __global__ void __launch_bounds__(256) mk_kernel_t1(MKArgs a) { mk_entry<1>(a); }
+extern "C" __global__ void __launch_bounds__(256) mk_kernel_t2(MKArgs a) { mk_entry<2>(a); }
+extern "C" __global__ void __launch_bounds__(256) mk_kernel_t3(MKArgs a) { mk_entry<3>(a); }
+extern "C" __global__ void __launch_bounds__(256) mk_kernel_t4(MKArgs a) { mk_entry<4>(a); }
 
 static const void* kernel_for(int T) {
   switch (T) {
@@ -729,6 +772,34 @@ extern "C" int mk_launch(const MKArgs* args, int blocks, int threads, void* stre
 }
 
 extern "C" const char* mk_error_string(int e) { return cudaGetErrorString((cudaError_t)e); }
+
+// Zero-copy host buffers (pinned + mapped) for inputs, outputs and the persistent-mode mailbox.
+extern "C" int mk_host_alloc(size_t bytes, void** hptr, void** dptr) {
+  cudaError_t e = cudaHostAlloc(hptr, bytes, cudaHostAllocMapped);
+  if (e != cudaSuccess) return (int)e;
+  memset(*hptr, 0, bytes);
+  return (int)cudaHostGetDevicePointer(dptr, *hptr, 0);
+}
+extern "C" int mk_host_free(void* hptr) { return (int)cudaFreeHost(hptr); }
+extern "C" int mk_stream_create(void** s) { return (int)cudaStreamCreateWithFlags((cudaStream_t*)s, cudaStreamNonBlocking); }
+extern "C" int mk_stream_sync(void* s) { return (int)cudaStreamSynchronize((cudaStream_t)s); }
+extern "C" int mk_stream_query(void* s) { return (int)cudaStreamQuery((cudaStream_t)s); }
+
+// Persistent-mode mailbox helpers (host side, C so the stores are ordered and the spin is cheap).
+extern "C" void mk_post(float* dst, const float* src, int n, int* mb, int seq, int cache_len, int cmd) {
+  if (n > 0) memcpy(dst, src, (size_t)n * sizeof(float));
+  mb[3] = cache_len;
+  mb[1] = cmd;
+  __sync_synchronize();                             // input + fields visible before seq
+  ((volatile int*)mb)[0] = seq;
+}
+extern "C" int mk_wait(int* mb, int seq, long long spin_limit) {
+  volatile int* v = mb;
+  long long i = 0;
+  while (v[2] != seq) { if (++i > spin_limit) return -1; }
+  __sync_synchronize();
+  return 0;
+}
 
 extern "C" int mk_args_size() { return (int)sizeof(MKArgs); }
 extern "C" int mk_layer_params_size() { return (int)sizeof(LayerParams); }
