@@ -306,7 +306,7 @@ class MegakernelEncoder:
         self.pidx = consts["pidx"].to(device)
         self.mask_by_len = {k: v.to(device) for k, v in consts["masks"].items()}
         self.use_kernel = use_kernel
-        self.flags = flags          # bit0: L2 prefetch next layer, bit1: fused LN_out, bit2: register prefetch next stage
+        self.flags = flags          # bit0: L2 prefetch next layer, bit1: fused LN_out (bit2 retired in v5)
         T = self.T
         z = lambda *s: torch.zeros(*s, dtype=torch.float32, device=device)  # noqa: E731
         self.x_in, self.x_out = z(T, D), z(T, D)
@@ -315,6 +315,7 @@ class MegakernelEncoder:
         self.timers = torch.zeros(self.nl * NSTAGE + 3, dtype=torch.int64, device=device) if timers else None
         self.ptimers = torch.zeros(self.nl * NSTAGE * 2, dtype=torch.int64, device=device) if timers else None
         if use_kernel:
+            assert threads == 256, "v5 kernel is compiled for 256 threads per block (__launch_bounds__(256), 250 regs)"
             L = lib()
             check(L.mk_prepare(threads), "mk_prepare")
             per_sm = ctypes.c_int(0)
@@ -396,8 +397,8 @@ class MegakernelEncoder:
         """Per (layer, stage): (input load, compute, barrier+prefetch) in µs as seen by block 0 (S10 excluded)."""
         if self.ptimers is None:
             return None
-        t = self.timers.cpu().double()
-        p = self.ptimers.cpu().double().view(self.nl, NSTAGE, 2)
+        t = self.timers.cpu().double().tolist()
+        p = self.ptimers.cpu().double().view(self.nl, NSTAGE, 2).tolist()
         out = []
         for l in range(self.nl):
             row = []

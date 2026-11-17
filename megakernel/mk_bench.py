@@ -120,8 +120,8 @@ def main():
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--stages", action="store_true")
     ap.add_argument("--paced", action="store_true")
-    ap.add_argument("--flags", type=int, default=2, help="bit0 L2 prefetch, bit1 fused LN_out, bit2 register prefetch")
-    ap.add_argument("--ablation", action="store_true", help="layers-only latency for flag combinations 0,1,2,4,6,7")
+    ap.add_argument("--flags", type=int, default=2, help="bit0 L2 prefetch, bit1 fused LN_out")
+    ap.add_argument("--ablation", action="store_true", help="layers-only latency for flags 0,1,2,3")
     ap.add_argument("--out", default="results")
     args = ap.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -160,17 +160,17 @@ def main():
     configs = [(args.threads, args.blocks or n_sm)]
     if args.sweep:
         configs = []
-        for th in (128, 256, 512):
+        for th in (256,):                     # v5 kernel: 256 threads/block (250 registers)
             probe = MegakernelEncoder(model, consts, threads=th, blocks=n_sm)
             for k in (1, 2, 3, 4):
                 if k * n_sm <= probe.max_blocks:
                     configs.append((th, k * n_sm))
             del probe
     if args.ablation:
-        names = {0: "no prefetch, LN_out separate", 1: "+ L2 prefetch of next layer", 2: "+ fused LN_out",
-                 4: "+ register prefetch of next stage", 6: "fused LN_out + register prefetch", 7: "all three"}
+        names = {0: "LN_out separate, no L2 prefetch", 1: "+ L2 prefetch of next layer", 2: "+ fused LN_out",
+                 3: "both"}
         th, bl = configs[0]
-        for fl in (0, 1, 2, 4, 6, 7):
+        for fl in (0, 1, 2, 3):
             mk = make_mk(model, consts, th, bl, False, xs, xlen, drop, flags=fl)
             for _ in range(30):
                 mk.layers_step()
