@@ -12,7 +12,8 @@
 | v5 | activation loads: 16-byte, all issued before use; GEMV: up to 4 rows (K=512) or 1 row (K=2048) per warp with every weight load issued before the first FMA; register prefetch retired; 256 threads, 250 registers | A6000: correct (3.3e-4 / 2.8e-3) but layers 1.651 ms vs v4.1's 1.485 (+11%); stage table crashed (fixed in v5.1). Hypothesis to test: the unrolled code is too large for the instruction cache, or fewer independent warps per SM hide less latency |
 | v5.1 | kernel instantiated per T (1–4): compile-time loops, fewer registers (T=2: 217), smaller code per kernel | A6000: correct; step 1.332 ms (layers ≈1.18) vs NeMo CUDA Graph 2.297 (1.72x) and B 1.99 (1.50x); paced 1.620 vs 2.576. Per layer 85 → 69 µs vs v4.1: S2/S9 9.2 → 5.1, S7 7.2 → 5.1, S3 9.2 → 7.2; so v5's idea works and its regression came from unrolling for T=4. Attention (13.3 µs) is now the largest stage |
 | v6 | split-K attention over up to 4 blocks per (head, query), partials merged in S5's load | A6000: correct; attention 13.3 → 6.1 µs but S5 3.1 → 7.2 µs (merge load 5 µs: serialized L2 reads); net layers 1.187 ms, unchanged |
-| v6.1 | merge loads all partials before any math (one round trip); flag 8 = adjacent rows per warp in the GEMV (contiguous 4 KB per warp instead of rows nwarps apart) | ablation flags 0/2/8/10 |
+| v6.1 | merge loads all partials before any math; flag 8 = adjacent rows per warp | A6000: correct (both mappings). Ablation (layers): flags 0 1.134 ms (best), fused LN_out 1.218, adjacent rows 1.237, both 1.294. Fused LN_out now hurts (its second LayerNorm is the unvectorised path) and adjacent rows hurt (strided rows spread the DRAM traffic and keep all 672 warps busy). S5 merge 7.2 → 6.1 µs. Best step ≈ 1.28 ms = 1.79x vs NeMo CUDA Graph. Default flags 0 |
+| v6.2 | every load a stage needs is issued up front: per-row epilogue operands (bias, residual, conv weights, conv cache) right after the weight loads; LayerNorm gamma/beta with the activation loads; attention mask + rel-pos index staged in shared memory once per launch. 512-row stages use 1 row per warp (fewer registers): 221 registers, no spills | expected: ~1 µs less per stage (dependent loads after the math removed) |
 
 v1 (this folder) runs all 17 layers of `parakeet_realtime_eou_120m` for one 160 ms chunk in **one cooperative
 launch**: 142 thread blocks (one per SM on an L40S) stay alive for the whole chunk and hand work to each other through
@@ -89,7 +90,8 @@ Per layer, 10 stages separated by `grid.sync()` (170 per chunk):
 | v5 | one-round-trip loads inside each stage | done: correct but slower (layers 1.651 vs 1.485 ms) |
 | v5.1 | one kernel per T (compile-time loops) | done: 1.72x vs NeMo CUDA Graph on A6000 |
 | v6 | split-K attention merged into S5's load | done: attention fixed, merge too slow |
-| v6.1 | one-round-trip merge + adjacent-row option (this folder) | S5 back to ~3–4 µs? do adjacent rows speed S1/S3/S8? |
+| v6.1 | one-round-trip merge + adjacent-row option | done: flags 0 best; adjacent rows and fused LN_out refuted on A6000 |
+| v6.2 | all loads of a stage issued up front (this folder) | does the compute phase drop to ~one round trip? |
 | v2 | fewer barriers: fuse S10 into the next S1, S5's commit into S6, LN stats reuse | latency vs number of barriers (170 → ~120) |
 | v3 | counters instead of `grid.sync`: a warp waits only for the rows it needs (e.g. S2 rows wait for S1) | barrier cost vs dependency-wait cost |
 | v4 | prefetch next stage's weights into shared memory with `cp.async` during the barrier | achieved bandwidth per stage |

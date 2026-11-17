@@ -1,4 +1,4 @@
-// Megakernel v6.1 (v6 + one-round-trip attention merge + optional adjacent-row GEMV mapping, flag 8): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
+// Megakernel v6.2 (v6.1 + epilogue operands, LayerNorm gamma/beta and attention masks fetched up front): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
 //
 // Stages per layer (each separated by a grid-wide barrier, 10 per layer):
 //   S1  LN_ff1(resid) -> FFN1 up (512->2048) + SiLU                -> h
@@ -33,6 +33,7 @@ namespace cg = cooperative_groups;
 #define NKEY_PAD 80          // >= CACHE + TMAX, per-warp attention scratch
 #define NSTAGE 10
 #define NEG_INF (__int_as_float(0xff800000))
+#define MASKED (-1000000)
 
 struct LayerParams {          // ALL fields are pointers: the host packs an int64 array in exactly this order
   const float *ln_ff1_g, *ln_ff1_b;
@@ -124,10 +125,16 @@ __device__ void block_load_k(const float* __restrict__ src, const float* g, cons
   constexpr int T = TT;
   constexpr int K4 = K / 4;
   constexpr int PER = (K4 + 255) / 256;          // float4 per thread per row (requires blockDim >= 256)
+  constexpr int PK = (K == D) ? K / 256 : 1;     // LayerNorm only ever runs on D-wide rows
   float v[2 * TT];
   float4 buf[TT][PER];
+  float gv[PK], bv[PK];
 #pragma unroll
   for (int i = 0; i < 2 * TT; ++i) v[i] = 0.f;
+  if (g != nullptr) {                             // gamma/beta loads go out together with the activation loads
+#pragma unroll
+    for (int j = 0; j < PK; ++j) { gv[j] = g[threadIdx.x + j * 256]; bv[j] = b[threadIdx.x + j * 256]; }
+  }
   const float4* s4 = reinterpret_cast<const float4*>(src);
   float4* x4 = reinterpret_cast<float4*>(xs);
 #pragma unroll
@@ -156,8 +163,10 @@ __device__ void block_load_k(const float* __restrict__ src, const float* g, cons
     const float mean = v[2 * t] / K;
     const float rstd = rsqrtf(fmaxf(v[2 * t + 1] / K - mean * mean, 0.f) + eps);
     float* row = xs + t * K;
-    for (int k = threadIdx.x; k < K; k += blockDim.x) {
-      float y = (row[k] - mean) * rstd * g[k] + b[k];
+#pragma unroll
+    for (int j = 0; j < PK; ++j) {
+      const int k = threadIdx.x + j * 256;
+      float y = (row[k] - mean) * rstd * gv[j] + bv[j];
       if (act == 1) y = silu(y);
       row[k] = y;
     }
@@ -307,7 +316,7 @@ __device__ void attention_block(const MKArgs& a, const LayerParams& P, const flo
 // writes an UNNORMALISED partial: max m, sum l = sum exp(score - m), o[d] = sum exp(score - m) * v[d].
 // The consumer stage (S5) merges the S partials while loading its input, so no extra barrier is needed.
 __device__ void attention_split(const MKArgs& a, const LayerParams& P, const float* kvK, const float* kvV,
-                                int head_ring, int h, int t, int s, int S, float* scratch) {
+                                int head_ring, int h, int t, int s, int S, float* scratch, const int* mp) {
   const int T = a.T, NK = CACHE + T;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, wpb = blockDim.x >> 5;
   const int per = (NK + S - 1) / S;
@@ -331,13 +340,14 @@ __device__ void attention_split(const MKArgs& a, const LayerParams& P, const flo
     const float4 qv0 = *reinterpret_cast<const float4*>(qv + sub * 8), qv1 = *reinterpret_cast<const float4*>(qv + sub * 8 + 4);
     for (int base = warp * 4; base < nkeys; base += wpb * 4) {
       const int jj = base + kq, j = j0 + jj;
-      const bool valid = (jj < nkeys) && (a.mask[t * NK + j] == 0);
+      const int code = (jj < nkeys) ? mp[t * NK + j] : MASKED;     // shared memory: no global round trip
+      const bool valid = code != MASKED;
       float v = 0.f;
       if (valid) {
         const float* krow = ((j < CACHE) ? kvK + ring_slot(head_ring, j) * D : a.qkv + (j - CACHE) * 3 * D + D) + h * DK + sub * 8;
         const float4 k0 = *reinterpret_cast<const float4*>(krow), k1 = *reinterpret_cast<const float4*>(krow + 4);
         v = qu0.x * k0.x + qu0.y * k0.y + qu0.z * k0.z + qu0.w * k0.w + qu1.x * k1.x + qu1.y * k1.y + qu1.z * k1.z + qu1.w * k1.w;
-        const int pi = a.pidx[t * NK + j];
+        const int pi = code;
         if (pi >= 0) {
           const float* prow = P.p + ((size_t)h * a.npos + pi) * DK + sub * 8;
           const float4 p0 = *reinterpret_cast<const float4*>(prow), p1 = *reinterpret_cast<const float4*>(prow + 4);
@@ -435,10 +445,14 @@ __device__ void attn_combine(const MKArgs& a, int S, float* xs) {
 // A warp computes R rows at once (R*K/256 16-byte loads per lane, all issued before the first FMA), so a stage pays
 // ~one DRAM round trip instead of one per loop iteration per row. R = 4 for K = 512, 1 for K = 2048 (32 registers).
 // PAIR: each work item is a channel c needing rows c and c+D (conv PW1 + GLU); R counts channels then.
+template <int N_> struct Ops { float v[N_]; };      // per-row epilogue operands (bias, residual, conv params)
+
 // contig: a warp takes R ADJACENT rows (one contiguous R*K*2-byte stretch) instead of rows nwarps apart.
-template <int K, int R, int PAIR, int TT, typename Epi>
+// pre(r) loads the row's epilogue operands right after its weight loads are issued, so they arrive in the same
+// round trip instead of after the math; epi(r, acc, acc2, ops) consumes them.
+template <int K, int R, int PAIR, int TT, typename Pre, typename Epi>
 __device__ __forceinline__ void gemv_rows(const half* __restrict__ W, int N, const float* xs, int gwarp,
-                                          int nwarps, int lane, bool contig, Epi epi) {
+                                          int nwarps, int lane, bool contig, Pre pre, Epi epi) {
   constexpr int IT = K / 256;
   constexpr int NQ = PAIR ? 2 : 1;
   const int di = contig ? 1 : nwarps;
@@ -454,6 +468,12 @@ __device__ __forceinline__ void gemv_rows(const half* __restrict__ W, int N, con
           for (int it = 0; it < IT; ++it)
             w[i][q][it] = __ldg(reinterpret_cast<const uint4*>(W + (size_t)(r + q * D) * K + lane * 8 + it * 256));
       }
+    }
+    decltype(pre(0)) ops[R];
+#pragma unroll
+    for (int i = 0; i < R; ++i) {
+      const int r = base + i * di;
+      if (r < N) ops[i] = pre(r);
     }
 #pragma unroll
     for (int i = 0; i < R; ++i) {
@@ -482,7 +502,7 @@ __device__ __forceinline__ void gemv_rows(const half* __restrict__ W, int N, con
 #pragma unroll
           for (int t = 0; t < TT; ++t) acc[q][t] = warp_sum(acc[q][t]);
         }
-        epi(r, acc[0], acc[NQ - 1]);
+        epi(r, acc[0], acc[NQ - 1], ops[i]);
       }
     }
   }
@@ -495,6 +515,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
   float* xs = smem;                           // TMAX*DFF floats
   float* red = xs + TMAX * DFF;               // 2*TMAX*32 = 256 floats
   float* attw = red + 256;                    // 1024 floats attention scratch
+  int* mp = reinterpret_cast<int*>(attw + 1024);   // TMAX*NKEY_PAD: pidx, or MASKED for masked keys
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, wpb = blockDim.x >> 5;
   const int gwarp = blockIdx.x * wpb + warp, nwarps = gridDim.x * wpb;
   const int gtid = blockIdx.x * blockDim.x + threadIdx.x, nthreads = gridDim.x * blockDim.x;
@@ -505,6 +526,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
   const bool contig = (a.flags & 8) != 0;                                     // bit3: adjacent rows per warp
 
   STAMP(0);
+  for (int i = threadIdx.x; i < T * (CACHE + T); i += blockDim.x) mp[i] = a.mask[i] ? MASKED : a.pidx[i];
   if (do_l2pf) prefetch_layer(a.layers[0], gtid, nthreads);
   for (int i = gtid; i < T * D; i += nthreads) a.resid0[i] = a.x_in[i];
   grid.sync(); STAMP(1);
@@ -529,27 +551,33 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
       block_load_k<D, TT>(resid, P.ln_ff1_g, P.ln_ff1_b, a.eps, 0, xs, red);
     }
     PSTAMP(0, 0);
-    gemv_rows<D, 4, 0, TT>(P.w_ff1_1, DFF, xs, gwarp, nwarps, lane, contig, [&](int r, float* acc, float*) {
-      if (lane == 0) { const float bb = P.b_ff1_1[r]; for (int t = 0; t < T; ++t) a.hbuf[t * DFF + r] = silu(acc[t] + bb); }
-    });
+    gemv_rows<D, 4, 0, TT>(P.w_ff1_1, DFF, xs, gwarp, nwarps, lane, contig,
+      [&](int r) { Ops<1> o; o.v[0] = P.b_ff1_1[r]; return o; },
+      [&](int r, float* acc, float*, const Ops<1>& o) {
+        if (lane == 0) for (int t = 0; t < T; ++t) a.hbuf[t * DFF + r] = silu(acc[t] + o.v[0]);
+      });
     PSTAMP(0, 1);
     grid.sync(); STAMP(ts + 0);
 
     // S2: FFN1 down; resid += fc * out
     block_load_k<DFF, TT>(a.hbuf, nullptr, nullptr, a.eps, 0, xs, red);
     PSTAMP(1, 0);
-    gemv_rows<DFF, 1, 0, TT>(P.w_ff1_2, D, xs, gwarp, nwarps, lane, contig, [&](int r, float* acc, float*) {
-      if (lane == 0) { const float bb = P.b_ff1_2[r]; for (int t = 0; t < T; ++t) resid[t * D + r] += a.fc_factor * (acc[t] + bb); }
-    });
+    gemv_rows<DFF, 1, 0, TT>(P.w_ff1_2, D, xs, gwarp, nwarps, lane, contig,
+      [&](int r) { Ops<1 + TT> o; o.v[0] = P.b_ff1_2[r]; for (int t = 0; t < TT; ++t) o.v[1 + t] = resid[t * D + r]; return o; },
+      [&](int r, float* acc, float*, const Ops<1 + TT>& o) {
+        if (lane == 0) for (int t = 0; t < T; ++t) resid[t * D + r] = o.v[1 + t] + a.fc_factor * (acc[t] + o.v[0]);
+      });
     PSTAMP(1, 1);
     grid.sync(); STAMP(ts + 1);
 
     // S3: LN_att + Q|K|V
     block_load_k<D, TT>(resid, P.ln_att_g, P.ln_att_b, a.eps, 0, xs, red);
     PSTAMP(2, 0);
-    gemv_rows<D, 4, 0, TT>(P.w_qkv, 3 * D, xs, gwarp, nwarps, lane, contig, [&](int r, float* acc, float*) {
-      if (lane == 0) { const float bb = P.b_qkv[r]; for (int t = 0; t < T; ++t) a.qkv[t * 3 * D + r] = acc[t] + bb; }
-    });
+    gemv_rows<D, 4, 0, TT>(P.w_qkv, 3 * D, xs, gwarp, nwarps, lane, contig,
+      [&](int r) { Ops<1> o; o.v[0] = P.b_qkv[r]; return o; },
+      [&](int r, float* acc, float*, const Ops<1>& o) {
+        if (lane == 0) for (int t = 0; t < T; ++t) a.qkv[t * 3 * D + r] = acc[t] + o.v[0];
+      });
     PSTAMP(2, 1);
     grid.sync(); STAMP(ts + 2);
 
@@ -557,7 +585,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
     PSTAMP(3, 0);
     for (int it = blockIdx.x; it < NH * T * S_att; it += gridDim.x) {
       const int s_ = it % S_att, ht = it / S_att;
-      attention_split(a, P, kvK, kvV, head_ring, ht / T, ht % T, s_, S_att, attw);
+      attention_split(a, P, kvK, kvV, head_ring, ht / T, ht % T, s_, S_att, attw, mp);
     }
     PSTAMP(3, 1);
     grid.sync(); STAMP(ts + 3);
@@ -565,9 +593,11 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
     // S5: output projection; resid += out; commit new K/V into the oldest ring slots
     attn_combine<TT>(a, S_att, xs);
     PSTAMP(4, 0);
-    gemv_rows<D, 4, 0, TT>(P.w_o, D, xs, gwarp, nwarps, lane, contig, [&](int r, float* acc, float*) {
-      if (lane == 0) { const float bb = P.b_o[r]; for (int t = 0; t < T; ++t) resid[t * D + r] += acc[t] + bb; }
-    });
+    gemv_rows<D, 1, 0, TT>(P.w_o, D, xs, gwarp, nwarps, lane, contig,
+      [&](int r) { Ops<1 + TT> o; o.v[0] = P.b_o[r]; for (int t = 0; t < TT; ++t) o.v[1 + t] = resid[t * D + r]; return o; },
+      [&](int r, float* acc, float*, const Ops<1 + TT>& o) {
+        if (lane == 0) for (int t = 0; t < T; ++t) resid[t * D + r] = o.v[1 + t] + acc[t] + o.v[0];
+      });
     for (int i = gtid; i < T * D; i += nthreads) {
       const int t = i / D, d = i % D, slot = (head_ring + t) % CACHE;
       kvK[slot * D + d] = a.qkv[t * 3 * D + D + d];
@@ -579,49 +609,67 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
     // S6: conv module part 1 (per-channel, owned by one warp): PW1 rows c and c+D, GLU, causal DW conv
     block_load_k<D, TT>(resid, P.ln_conv_g, P.ln_conv_b, a.eps, 0, xs, red);
     PSTAMP(5, 0);
-    gemv_rows<D, 2, 1, TT>(P.w_pw1, D, xs, gwarp, nwarps, lane, contig, [&](int c, float* ga, float* gb) {
-      if (lane == 0) {
-        float hist[KC + TT];
-        for (int j = 0; j < KC; ++j) hist[j] = cc[c * KC + j];
-        for (int t = 0; t < T; ++t) {
-          const float av = ga[t] + P.b_pw1[c], gv = gb[t] + P.b_pw1[c + D];
-          hist[KC + t] = av / (1.f + __expf(-gv));                     // GLU: a * sigmoid(b)
+    gemv_rows<D, 1, 1, TT>(P.w_pw1, D, xs, gwarp, nwarps, lane, contig,
+      [&](int c) {                                    // b_pw1 (a, gate), b_dw, w_dw[KS], conv cache[KC]
+        Ops<3 + KS + KC> o;
+        o.v[0] = P.b_pw1[c]; o.v[1] = P.b_pw1[c + D]; o.v[2] = P.b_dw[c];
+#pragma unroll
+        for (int j = 0; j < KS; ++j) o.v[3 + j] = P.w_dw[c * KS + j];
+#pragma unroll
+        for (int j = 0; j < KC; ++j) o.v[3 + KS + j] = cc[c * KC + j];
+        return o;
+      },
+      [&](int c, float* ga, float* gb, const Ops<3 + KS + KC>& o) {
+        if (lane == 0) {
+          float hist[KC + TT];
+#pragma unroll
+          for (int j = 0; j < KC; ++j) hist[j] = o.v[3 + KS + j];
+#pragma unroll
+          for (int t = 0; t < TT; ++t) hist[KC + t] = (ga[t] + o.v[0]) / (1.f + __expf(-(gb[t] + o.v[1])));   // GLU
+#pragma unroll
+          for (int t = 0; t < TT; ++t) {
+            float acc = o.v[2];
+#pragma unroll
+            for (int j = 0; j < KS; ++j) acc += o.v[3 + j] * hist[t + j];
+            a.ybuf[t * D + c] = acc;
+          }
+#pragma unroll
+          for (int j = 0; j < KC; ++j) cc[c * KC + j] = hist[TT + j];   // last KC of [cache | new]
         }
-        for (int t = 0; t < T; ++t) {
-          float s = P.b_dw[c];
-          for (int j = 0; j < KS; ++j) s += P.w_dw[c * KS + j] * hist[t + j];
-          a.ybuf[t * D + c] = s;
-        }
-        for (int j = 0; j < KC; ++j) cc[c * KC + j] = hist[T + j];      // last KC of [cache | new]
-      }
-    });
+      });
     PSTAMP(5, 1);
     grid.sync(); STAMP(ts + 5);
 
     // S7: conv module part 2: LN_cn(y) + SiLU -> PW2; resid += out
     block_load_k<D, TT>(a.ybuf, P.ln_cn_g, P.ln_cn_b, a.eps, 1, xs, red);
     PSTAMP(6, 0);
-    gemv_rows<D, 4, 0, TT>(P.w_pw2, D, xs, gwarp, nwarps, lane, contig, [&](int r, float* acc, float*) {
-      if (lane == 0) { const float bb = P.b_pw2[r]; for (int t = 0; t < T; ++t) resid[t * D + r] += acc[t] + bb; }
-    });
+    gemv_rows<D, 1, 0, TT>(P.w_pw2, D, xs, gwarp, nwarps, lane, contig,
+      [&](int r) { Ops<1 + TT> o; o.v[0] = P.b_pw2[r]; for (int t = 0; t < TT; ++t) o.v[1 + t] = resid[t * D + r]; return o; },
+      [&](int r, float* acc, float*, const Ops<1 + TT>& o) {
+        if (lane == 0) for (int t = 0; t < T; ++t) resid[t * D + r] = o.v[1 + t] + acc[t] + o.v[0];
+      });
     PSTAMP(6, 1);
     grid.sync(); STAMP(ts + 6);
 
     // S8: LN_ff2 + FFN2 up + SiLU
     block_load_k<D, TT>(resid, P.ln_ff2_g, P.ln_ff2_b, a.eps, 0, xs, red);
     PSTAMP(7, 0);
-    gemv_rows<D, 4, 0, TT>(P.w_ff2_1, DFF, xs, gwarp, nwarps, lane, contig, [&](int r, float* acc, float*) {
-      if (lane == 0) { const float bb = P.b_ff2_1[r]; for (int t = 0; t < T; ++t) a.hbuf[t * DFF + r] = silu(acc[t] + bb); }
-    });
+    gemv_rows<D, 4, 0, TT>(P.w_ff2_1, DFF, xs, gwarp, nwarps, lane, contig,
+      [&](int r) { Ops<1> o; o.v[0] = P.b_ff2_1[r]; return o; },
+      [&](int r, float* acc, float*, const Ops<1>& o) {
+        if (lane == 0) for (int t = 0; t < T; ++t) a.hbuf[t * DFF + r] = silu(acc[t] + o.v[0]);
+      });
     PSTAMP(7, 1);
     grid.sync(); STAMP(ts + 7);
 
     // S9: FFN2 down; resid += fc * out
     block_load_k<DFF, TT>(a.hbuf, nullptr, nullptr, a.eps, 0, xs, red);
     PSTAMP(8, 0);
-    gemv_rows<DFF, 1, 0, TT>(P.w_ff2_2, D, xs, gwarp, nwarps, lane, contig, [&](int r, float* acc, float*) {
-      if (lane == 0) { const float bb = P.b_ff2_2[r]; for (int t = 0; t < T; ++t) resid[t * D + r] += a.fc_factor * (acc[t] + bb); }
-    });
+    gemv_rows<DFF, 1, 0, TT>(P.w_ff2_2, D, xs, gwarp, nwarps, lane, contig,
+      [&](int r) { Ops<1 + TT> o; o.v[0] = P.b_ff2_2[r]; for (int t = 0; t < TT; ++t) o.v[1 + t] = resid[t * D + r]; return o; },
+      [&](int r, float* acc, float*, const Ops<1 + TT>& o) {
+        if (lane == 0) for (int t = 0; t < T; ++t) resid[t * D + r] = o.v[1 + t] + a.fc_factor * (acc[t] + o.v[0]);
+      });
     PSTAMP(8, 1);
     grid.sync(); STAMP(ts + 8);
 
@@ -658,7 +706,7 @@ static const void* kernel_for(int T) {
 }
 
 // ------------------------------------------------------------------------------------------- host API (ctypes)
-extern "C" int mk_smem_bytes(int threads) { (void)threads; return (TMAX * DFF + 256 + 1024) * (int)sizeof(float); }
+extern "C" int mk_smem_bytes(int threads) { (void)threads; return (TMAX * DFF + 256 + 1024 + TMAX * NKEY_PAD) * (int)sizeof(float); }
 
 extern "C" int mk_prepare(int threads) {
   const int smem = mk_smem_bytes(threads);

@@ -290,7 +290,7 @@ class MegakernelEncoder:
     """One streaming encoder step = NeMo pre-encode (subsampling + pos-enc scaling) + the megakernel for all layers."""
 
     def __init__(self, model, consts, threads: int = 256, blocks: Optional[int] = None, timers: bool = False,
-                 use_kernel: bool = True, device="cuda", wdtype=None, flags: int = 2):
+                 use_kernel: bool = True, device="cuda", wdtype=None, flags: int = 0):
         self.model, self.enc, self.consts = model, model.encoder, consts
         self.device = device
         self.T = consts["T"]
@@ -306,7 +306,7 @@ class MegakernelEncoder:
         self.pidx = consts["pidx"].to(device)
         self.mask_by_len = {k: v.to(device) for k, v in consts["masks"].items()}
         self.use_kernel = use_kernel
-        self.flags = flags          # bit0: L2 prefetch next layer, bit1: fused LN_out (bit2 retired in v5)
+        self.flags = flags          # bit0: L2 prefetch next layer, bit1: fused LN_out, bit3: adjacent rows (default 0 since v6.1)
         T = self.T
         z = lambda *s: torch.zeros(*s, dtype=torch.float32, device=device)  # noqa: E731
         self.x_in, self.x_out = z(T, D), z(T, D)
