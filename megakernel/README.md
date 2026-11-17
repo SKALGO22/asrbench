@@ -6,7 +6,8 @@
 | --- | --- | --- |
 | v1 | one cooperative launch, 10 grid barriers per layer | correct (FP32 rel.err 6.6e-4, FP16 3.5e-3); layers 2.49 ms, step 2.61 ms vs NeMo CUDA Graph 1.82 ms. Per-stage: attention 95.7 µs/layer = 65% of the time (16 warps, uncoalesced per-lane dot products); other stages 3.3–6.9 µs, matrix stages 260–330 GB/s |
 | v2 | attention: one block per (head, query), lanes along head dims (coalesced), warps over keys; single-pass LayerNorm statistics | correct (same errors); layers 1.13 ms, step 1.24 ms vs NeMo CUDA Graph 1.82 ms (1.47×). Attention 95.7 → 14.3 µs/layer. A weight-free stage (S10) still costs 3.6 µs: fixed per-stage cost ≈ half of all time; matrix stages 250–315 GB/s |
-| v3 | flags (default 3): bit0 = L2 prefetch of the next layer's 12.6 MB of weights at each layer start (fire-and-forget, all threads); bit1 = LN_out fused into the next layer's S1 (9 barriers per layer); attention scores 4 keys per warp per round with float4 loads, branch-free output loop | run `mk_bench.py --ablation` for the contribution of each |
+| v3 | flags: bit0 = L2 prefetch of the next layer's 12.6 MB at each layer start; bit1 = LN_out fused into the next layer's S1 (9 barriers/layer); attention 4 keys per warp per round, float4 | correct. Ablation (layers): none 1.124 ms, +L2 prefetch 1.202 (worse: issuing ~100k prefetches costs ~9 µs per layer in S1 and the matrix stages did not speed up, so they are not DRAM-bound), +fused LN_out 1.097 (best), both 1.176. Attention 14.3 → 10.2 µs. Approach B on the same GPU: 1.565 ms; NeMo CUDA Graph 1.828 ms |
+| v4 | bit2 = register prefetch: before every barrier each warp loads the weight rows it needs in the NEXT stage into registers (8 x 16 B per lane), so the stage after the barrier starts computing without a DRAM round trip. Default flags 6 (fused LN_out + register prefetch). 128 registers, no spills | run `mk_bench.py --ablation` |
 
 v1 (this folder) runs all 17 layers of `parakeet_realtime_eou_120m` for one 160 ms chunk in **one cooperative
 launch**: 142 thread blocks (one per SM on an L40S) stay alive for the whole chunk and hand work to each other through
@@ -43,7 +44,7 @@ python megakernel/mk_test.py                 # kernel vs FP16 NeMo, tolerance 2e
 python megakernel/mk_test.py --fp32 --layers 1   # if the full run fails: find the first diverging layer
 python megakernel/mk_bench.py --stages --paced   # latency, per-stage breakdown, real-time mode
 python megakernel/mk_bench.py --sweep            # threads x blocks-per-SM
-python megakernel/mk_bench.py --ablation         # v3 flags 0..3: prefetch and fused LN_out on/off
+python megakernel/mk_bench.py --ablation         # flag combinations: L2 prefetch, fused LN_out, register prefetch
 ```
 
 The library is rebuilt automatically when `csrc/mk.cu` changes (`build/libmk.so`). Override the target with
@@ -78,7 +79,8 @@ Per layer, 10 stages separated by `grid.sync()` (170 per chunk):
 | --- | --- | --- |
 | v1 | one launch, `grid.sync` per stage | parity; per-stage time and GB/s (done: attention dominated) |
 | v2 | block-parallel attention, single-pass LayerNorm | done: fixed per-stage cost and sub-peak bandwidth dominate |
-| v3 | L2 prefetch of next layer + fused LN_out + faster attention (this folder) | ablation: prefetch vs barrier removal |
+| v3 | L2 prefetch of next layer + fused LN_out + faster attention | done: stages are latency-chain bound, not bandwidth bound |
+| v4 | register prefetch of the next stage's rows (this folder) | does hiding one DRAM round trip per stage lower the ~3.5 µs fixed cost? |
 | v2 | fewer barriers: fuse S10 into the next S1, S5's commit into S6, LN stats reuse | latency vs number of barriers (170 → ~120) |
 | v3 | counters instead of `grid.sync`: a warp waits only for the rows it needs (e.g. S2 rows wait for S1) | barrier cost vs dependency-wait cost |
 | v4 | prefetch next stage's weights into shared memory with `cp.async` during the barrier | achieved bandwidth per stage |

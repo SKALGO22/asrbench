@@ -1,4 +1,4 @@
-// Megakernel v3 (v2 + L2 prefetch of the next layer's weights, LayerNorm-out fused into the next layer, faster attention): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
+// Megakernel v4 (v3 + register prefetch of the next stage's weight rows before every barrier): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
 //
 // Stages per layer (each separated by a grid-wide barrier, 10 per layer):
 //   S1  LN_ff1(resid) -> FFN1 up (512->2048) + SiLU                -> h
@@ -73,7 +73,7 @@ struct MKArgs {
   int n_layers;
   int T;
   int npos;
-  int flags;                  // bit0: L2-prefetch next layer's weights, bit1: fuse LN_out into the next layer's S1
+  int flags;                  // bit0: L2-prefetch next layer, bit1: fuse LN_out into next S1, bit2: register-prefetch next stage's rows
   float eps;
   float fc_factor;
   float att_scale;
@@ -284,6 +284,88 @@ __device__ void attention_block(const MKArgs& a, const LayerParams& P, const flo
 
 #define STAMP(idx) do { if (a.timers && blockIdx.x == 0 && threadIdx.x == 0) a.timers[(idx)] = gtimer(); } while (0)
 
+// ------------------------------------------------------------------------------------------- register prefetch
+// Each warp knows, before a barrier, which weight rows it will need in the NEXT stage (weights do not depend on
+// activations). With flag bit2 it loads them into registers before the barrier, so the stage after the barrier
+// starts computing immediately instead of waiting a DRAM round trip. 8 x 16 B per lane = 2 rows of K=512
+// (or a channel pair c, c+512) per register slot group, or 1 row of K=2048.
+#define PRE_N 8
+
+template <int PER_ROW, int PAIR>
+__device__ __forceinline__ void prefetch_t(const half* __restrict__ W, int N, int K, int gwarp, int nwarps, int lane,
+                                           uint4 (&pre)[PRE_N]) {
+  constexpr int NQ = PAIR ? 2 : 1;
+  constexpr int ITEMS = (PRE_N / PER_ROW) / NQ;
+#pragma unroll
+  for (int i = 0; i < ITEMS; ++i) {
+    const int r = gwarp + i * nwarps;
+    if (r < N) {
+#pragma unroll
+      for (int q = 0; q < NQ; ++q) {
+        const half* wr = W + (size_t)(r + q * D) * K + lane * 8;
+#pragma unroll
+        for (int it = 0; it < PER_ROW; ++it)
+          pre[(i * NQ + q) * PER_ROW + it] = __ldg(reinterpret_cast<const uint4*>(wr + it * 256));
+      }
+    }
+  }
+}
+
+template <int PER_ROW>
+__device__ __forceinline__ void dot_regs(const uint4* w, const float* xs, int K, int T, int lane, float acc[TMAX]) {
+#pragma unroll
+  for (int t = 0; t < TMAX; ++t) acc[t] = 0.f;
+#pragma unroll
+  for (int it = 0; it < PER_ROW; ++it) {
+    const int k = lane * 8 + it * 256;
+    const half2* w2 = reinterpret_cast<const half2*>(&w[it]);
+    float wf[8];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { const float2 f = __half22float2(w2[i]); wf[2 * i] = f.x; wf[2 * i + 1] = f.y; }
+#pragma unroll
+    for (int t = 0; t < TMAX; ++t) {
+      if (t < T) {
+        const float4* xr = reinterpret_cast<const float4*>(xs + t * K + k);
+        const float4 a0 = xr[0], a1 = xr[1];
+        acc[t] += wf[0] * a0.x + wf[1] * a0.y + wf[2] * a0.z + wf[3] * a0.w
+                + wf[4] * a1.x + wf[5] * a1.y + wf[6] * a1.z + wf[7] * a1.w;
+      }
+    }
+  }
+#pragma unroll
+  for (int t = 0; t < TMAX; ++t) acc[t] = warp_sum(acc[t]);
+}
+
+// Rows r = gwarp, gwarp+nwarps, ... of W (pairs r and r+D if PAIR): the first ITEMS come from registers if have_pre,
+// the rest are loaded normally. epi(r, acc, acc2) is called in every lane (it decides which lane writes).
+template <int PER_ROW, int PAIR, typename Epi>
+__device__ __forceinline__ void gemv_pre(const half* __restrict__ W, int N, int K, const float* xs, int T, int gwarp,
+                                         int nwarps, int lane, uint4 (&pre)[PRE_N], bool have_pre, Epi epi) {
+  constexpr int NQ = PAIR ? 2 : 1;
+  constexpr int ITEMS = (PRE_N / PER_ROW) / NQ;
+  float acc[TMAX], acc2[TMAX];
+#pragma unroll
+  for (int t = 0; t < TMAX; ++t) acc2[t] = 0.f;
+  int r0 = gwarp;
+  if (have_pre) {
+#pragma unroll
+    for (int i = 0; i < ITEMS; ++i) {
+      const int r = gwarp + i * nwarps;
+      if (r < N) {
+        dot_regs<PER_ROW>(&pre[(i * NQ) * PER_ROW], xs, K, T, lane, acc);
+        if (PAIR) dot_regs<PER_ROW>(&pre[(i * NQ + 1) * PER_ROW], xs, K, T, lane, acc2);
+        epi(r, acc, acc2);
+      }
+    }
+    r0 = gwarp + ITEMS * nwarps;
+  }
+  for (int r = r0; r < N; r += nwarps) {
+    row_dot(W + (size_t)r * K, K, xs, T, lane, acc);
+    if (PAIR) row_dot(W + (size_t)(r + D) * K, K, xs, T, lane, acc2);
+    epi(r, acc, acc2);
+  }
+}
+
 extern "C" __global__ void __launch_bounds__(512) mk_kernel(MKArgs a) {
   cg::grid_group grid = cg::this_grid();
   extern __shared__ float smem[];
@@ -295,11 +377,12 @@ extern "C" __global__ void __launch_bounds__(512) mk_kernel(MKArgs a) {
   const int gtid = blockIdx.x * blockDim.x + threadIdx.x, nthreads = gridDim.x * blockDim.x;
   const int T = a.T;
   const int head_ring = *a.ring_head;
-  float acc[TMAX];
+  const bool do_l2pf = (a.flags & 1) != 0, fuse_ln = (a.flags & 2) != 0, regpf = (a.flags & 4) != 0;
+  uint4 pre[PRE_N];
 
   STAMP(0);
-  const bool do_prefetch = (a.flags & 1) != 0, fuse_ln = (a.flags & 2) != 0;
-  if (do_prefetch) prefetch_layer(a.layers[0], gtid, nthreads);
+  if (do_l2pf) prefetch_layer(a.layers[0], gtid, nthreads);
+  if (regpf) prefetch_t<2, 0>(a.layers[0].w_ff1_1, DFF, D, gwarp, nwarps, lane, pre);
   for (int i = gtid; i < T * D; i += nthreads) a.resid0[i] = a.x_in[i];
   grid.sync(); STAMP(1);
   float* resid = a.resid0;
@@ -311,38 +394,37 @@ extern "C" __global__ void __launch_bounds__(512) mk_kernel(MKArgs a) {
     float* kvV = kvK + (size_t)CACHE * D;
     float* cc = a.conv_cache + (size_t)l * D * KC;
     const int ts = 2 + l * NSTAGE;
-
-    if (do_prefetch && l + 1 < a.n_layers) prefetch_layer(a.layers[l + 1], gtid, nthreads);
+    if (do_l2pf && l + 1 < a.n_layers) prefetch_layer(a.layers[l + 1], gtid, nthreads);
 
     // S1: [LN_out of the previous layer, if fused] + LN_ff1 + FFN1 up + SiLU
     if (fuse_ln && l > 0) {
       block_load(resid, T, D, a.layers[l - 1].ln_out_g, a.layers[l - 1].ln_out_b, a.eps, 0, xs, red);
       for (int i = gtid; i < T * D; i += nthreads) resid_next[i] = xs[i];   // this layer's residual input
       block_ln_inplace(xs, T, D, P.ln_ff1_g, P.ln_ff1_b, a.eps, 0, red);
-      float* tmp = resid; resid = resid_next; resid_next = tmp;              // S2.. read/update the new residual
+      float* tmp = resid; resid = resid_next; resid_next = tmp;
     } else {
       block_load(resid, T, D, P.ln_ff1_g, P.ln_ff1_b, a.eps, 0, xs, red);
     }
-    for (int r = gwarp; r < DFF; r += nwarps) {
-      row_dot(P.w_ff1_1 + (size_t)r * D, D, xs, T, lane, acc);
+    gemv_pre<2, 0>(P.w_ff1_1, DFF, D, xs, T, gwarp, nwarps, lane, pre, regpf, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_ff1_1[r]; for (int t = 0; t < T; ++t) a.hbuf[t * DFF + r] = silu(acc[t] + bb); }
-    }
+    });
+    if (regpf) prefetch_t<8, 0>(P.w_ff1_2, D, DFF, gwarp, nwarps, lane, pre);
     grid.sync(); STAMP(ts + 0);
 
     // S2: FFN1 down; resid += fc * out
     block_load(a.hbuf, T, DFF, nullptr, nullptr, a.eps, 0, xs, red);
-    for (int r = gwarp; r < D; r += nwarps) {
-      row_dot(P.w_ff1_2 + (size_t)r * DFF, DFF, xs, T, lane, acc);
+    gemv_pre<8, 0>(P.w_ff1_2, D, DFF, xs, T, gwarp, nwarps, lane, pre, regpf, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_ff1_2[r]; for (int t = 0; t < T; ++t) resid[t * D + r] += a.fc_factor * (acc[t] + bb); }
-    }
+    });
+    if (regpf) prefetch_t<2, 0>(P.w_qkv, 3 * D, D, gwarp, nwarps, lane, pre);
     grid.sync(); STAMP(ts + 1);
 
     // S3: LN_att + Q|K|V
     block_load(resid, T, D, P.ln_att_g, P.ln_att_b, a.eps, 0, xs, red);
-    for (int r = gwarp; r < 3 * D; r += nwarps) {
-      row_dot(P.w_qkv + (size_t)r * D, D, xs, T, lane, acc);
+    gemv_pre<2, 0>(P.w_qkv, 3 * D, D, xs, T, gwarp, nwarps, lane, pre, regpf, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_qkv[r]; for (int t = 0; t < T; ++t) a.qkv[t * 3 * D + r] = acc[t] + bb; }
-    }
+    });
+    if (regpf) prefetch_t<2, 0>(P.w_o, D, D, gwarp, nwarps, lane, pre);     // held through the attention stage
     grid.sync(); STAMP(ts + 2);
 
     // S4: attention core
@@ -352,23 +434,20 @@ extern "C" __global__ void __launch_bounds__(512) mk_kernel(MKArgs a) {
 
     // S5: output projection; resid += out; commit new K/V into the oldest ring slots
     block_load(a.att, T, D, nullptr, nullptr, a.eps, 0, xs, red);
-    for (int r = gwarp; r < D; r += nwarps) {
-      row_dot(P.w_o + (size_t)r * D, D, xs, T, lane, acc);
+    gemv_pre<2, 0>(P.w_o, D, D, xs, T, gwarp, nwarps, lane, pre, regpf, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_o[r]; for (int t = 0; t < T; ++t) resid[t * D + r] += acc[t] + bb; }
-    }
+    });
     for (int i = gtid; i < T * D; i += nthreads) {
       const int t = i / D, d = i % D, slot = (head_ring + t) % CACHE;
       kvK[slot * D + d] = a.qkv[t * 3 * D + D + d];
       kvV[slot * D + d] = a.qkv[t * 3 * D + 2 * D + d];
     }
+    if (regpf) prefetch_t<2, 1>(P.w_pw1, D, D, gwarp, nwarps, lane, pre);
     grid.sync(); STAMP(ts + 4);
 
     // S6: conv module part 1 (per-channel, owned by one warp): PW1 rows c and c+D, GLU, causal DW conv
     block_load(resid, T, D, P.ln_conv_g, P.ln_conv_b, a.eps, 0, xs, red);
-    for (int c = gwarp; c < D; c += nwarps) {
-      float ga[TMAX], gb[TMAX];
-      row_dot(P.w_pw1 + (size_t)c * D, D, xs, T, lane, ga);
-      row_dot(P.w_pw1 + (size_t)(c + D) * D, D, xs, T, lane, gb);
+    gemv_pre<2, 1>(P.w_pw1, D, D, xs, T, gwarp, nwarps, lane, pre, regpf, [&](int c, float* ga, float* gb) {
       if (lane == 0) {
         float hist[KC + TMAX];
         for (int j = 0; j < KC; ++j) hist[j] = cc[c * KC + j];
@@ -383,31 +462,32 @@ extern "C" __global__ void __launch_bounds__(512) mk_kernel(MKArgs a) {
         }
         for (int j = 0; j < KC; ++j) cc[c * KC + j] = hist[T + j];      // last KC of [cache | new]
       }
-    }
+    });
+    if (regpf) prefetch_t<2, 0>(P.w_pw2, D, D, gwarp, nwarps, lane, pre);
     grid.sync(); STAMP(ts + 5);
 
     // S7: conv module part 2: LN_cn(y) + SiLU -> PW2; resid += out
     block_load(a.ybuf, T, D, P.ln_cn_g, P.ln_cn_b, a.eps, 1, xs, red);
-    for (int r = gwarp; r < D; r += nwarps) {
-      row_dot(P.w_pw2 + (size_t)r * D, D, xs, T, lane, acc);
+    gemv_pre<2, 0>(P.w_pw2, D, D, xs, T, gwarp, nwarps, lane, pre, regpf, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_pw2[r]; for (int t = 0; t < T; ++t) resid[t * D + r] += acc[t] + bb; }
-    }
+    });
+    if (regpf) prefetch_t<2, 0>(P.w_ff2_1, DFF, D, gwarp, nwarps, lane, pre);
     grid.sync(); STAMP(ts + 6);
 
     // S8: LN_ff2 + FFN2 up + SiLU
     block_load(resid, T, D, P.ln_ff2_g, P.ln_ff2_b, a.eps, 0, xs, red);
-    for (int r = gwarp; r < DFF; r += nwarps) {
-      row_dot(P.w_ff2_1 + (size_t)r * D, D, xs, T, lane, acc);
+    gemv_pre<2, 0>(P.w_ff2_1, DFF, D, xs, T, gwarp, nwarps, lane, pre, regpf, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_ff2_1[r]; for (int t = 0; t < T; ++t) a.hbuf[t * DFF + r] = silu(acc[t] + bb); }
-    }
+    });
+    if (regpf) prefetch_t<8, 0>(P.w_ff2_2, D, DFF, gwarp, nwarps, lane, pre);
     grid.sync(); STAMP(ts + 7);
 
     // S9: FFN2 down; resid += fc * out
     block_load(a.hbuf, T, DFF, nullptr, nullptr, a.eps, 0, xs, red);
-    for (int r = gwarp; r < D; r += nwarps) {
-      row_dot(P.w_ff2_2 + (size_t)r * DFF, DFF, xs, T, lane, acc);
+    gemv_pre<8, 0>(P.w_ff2_2, D, DFF, xs, T, gwarp, nwarps, lane, pre, regpf, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_ff2_2[r]; for (int t = 0; t < T; ++t) resid[t * D + r] += a.fc_factor * (acc[t] + bb); }
-    }
+    });
+    if (regpf && l + 1 < a.n_layers) prefetch_t<2, 0>(a.layers[l + 1].w_ff1_1, DFF, D, gwarp, nwarps, lane, pre);
     grid.sync(); STAMP(ts + 8);
 
     // S10: LN_out -> next residual (ping-pong: other blocks may still be reading resid for their statistics).

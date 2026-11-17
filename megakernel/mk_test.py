@@ -55,7 +55,7 @@ def main():
     ap.add_argument("--layers", type=int, default=0, help="only the first N layers (debug); 0 = all")
     ap.add_argument("--threads", type=int, default=256)
     ap.add_argument("--blocks", type=int, default=0)
-    ap.add_argument("--flags", type=int, default=3, help="bit0 L2 prefetch, bit1 fused LN_out (default both)")
+    ap.add_argument("--flags", type=int, default=6, help="bit0 L2 prefetch, bit1 fused LN_out, bit2 register prefetch (default 6)")
     ap.add_argument("--tol", type=float, default=0.0, help="max allowed relative error (default: 2e-2 FP16, 1e-3 FP32)")
     args = ap.parse_args()
     torch.manual_seed(0)
