@@ -11,7 +11,8 @@
 | v4.1 | per-stage phase timers (block 0): input load / compute / barrier | A6000, flags 2, per layer ≈ load 30 µs, compute 50 µs, barrier 9 µs (~1 µs each; grid.sync alone 0.64 µs). Loading 4–16 KB of activations took 3–7 µs and a 4 KB-row GEMV 5 µs: both are serialized round trips (one load in flight at a time), not bandwidth. Register prefetch (flag 4) shortened compute but grew the barrier phase, so the fence in grid.sync waits for the prefetch loads |
 | v5 | activation loads: 16-byte, all issued before use; GEMV: up to 4 rows (K=512) or 1 row (K=2048) per warp with every weight load issued before the first FMA; register prefetch retired; 256 threads, 250 registers | A6000: correct (3.3e-4 / 2.8e-3) but layers 1.651 ms vs v4.1's 1.485 (+11%); stage table crashed (fixed in v5.1). Hypothesis to test: the unrolled code is too large for the instruction cache, or fewer independent warps per SM hide less latency |
 | v5.1 | kernel instantiated per T (1–4): compile-time loops, fewer registers (T=2: 217), smaller code per kernel | A6000: correct; step 1.332 ms (layers ≈1.18) vs NeMo CUDA Graph 2.297 (1.72x) and B 1.99 (1.50x); paced 1.620 vs 2.576. Per layer 85 → 69 µs vs v4.1: S2/S9 9.2 → 5.1, S7 7.2 → 5.1, S3 9.2 → 7.2; so v5's idea works and its regression came from unrolling for T=4. Attention (13.3 µs) is now the largest stage |
-| v6 | split-K attention: each (head, query) split over up to 4 blocks (64 of 84 blocks busy instead of 16), unnormalised partials merged by every block while loading S5's input (no extra barrier) | expected: attention ≈ 3–5 µs, layers ≈ 1.0 ms |
+| v6 | split-K attention over up to 4 blocks per (head, query), partials merged in S5's load | A6000: correct; attention 13.3 → 6.1 µs but S5 3.1 → 7.2 µs (merge load 5 µs: serialized L2 reads); net layers 1.187 ms, unchanged |
+| v6.1 | merge loads all partials before any math (one round trip); flag 8 = adjacent rows per warp in the GEMV (contiguous 4 KB per warp instead of rows nwarps apart) | ablation flags 0/2/8/10 |
 
 v1 (this folder) runs all 17 layers of `parakeet_realtime_eou_120m` for one 160 ms chunk in **one cooperative
 launch**: 142 thread blocks (one per SM on an L40S) stay alive for the whole chunk and hand work to each other through
@@ -87,7 +88,8 @@ Per layer, 10 stages separated by `grid.sync()` (170 per chunk):
 | v4 | register prefetch of the next stage's rows | done: no (fence waits for it) |
 | v5 | one-round-trip loads inside each stage | done: correct but slower (layers 1.651 vs 1.485 ms) |
 | v5.1 | one kernel per T (compile-time loops) | done: 1.72x vs NeMo CUDA Graph on A6000 |
-| v6 | split-K attention merged into S5's load (this folder) | attention stage time; next target from the phase table |
+| v6 | split-K attention merged into S5's load | done: attention fixed, merge too slow |
+| v6.1 | one-round-trip merge + adjacent-row option (this folder) | S5 back to ~3–4 µs? do adjacent rows speed S1/S3/S8? |
 | v2 | fewer barriers: fuse S10 into the next S1, S5's commit into S6, LN stats reuse | latency vs number of barriers (170 → ~120) |
 | v3 | counters instead of `grid.sync`: a warp waits only for the rows it needs (e.g. S2 rows wait for S1) | barrier cost vs dependency-wait cost |
 | v4 | prefetch next stage's weights into shared memory with `cp.async` during the barrier | achieved bandwidth per stage |

@@ -1,4 +1,4 @@
-// Megakernel v6 (v5.1 + split-K attention over up to 4 blocks per (head, query), merged in S5's load): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
+// Megakernel v6.1 (v6 + one-round-trip attention merge + optional adjacent-row GEMV mapping, flag 8): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
 //
 // Stages per layer (each separated by a grid-wide barrier, 10 per layer):
 //   S1  LN_ff1(resid) -> FFN1 up (512->2048) + SiLU                -> h
@@ -74,7 +74,7 @@ struct MKArgs {
   int n_layers;
   int T;
   int npos;
-  int flags;                  // bit0: L2-prefetch next layer, bit1: fuse LN_out into next S1, bit2: register-prefetch next stage's rows
+  int flags;                  // bit0: L2-prefetch next layer, bit1: fuse LN_out into next S1, bit3: adjacent rows per warp
   float eps;
   float fc_factor;
   float att_scale;
@@ -385,23 +385,45 @@ __device__ void attention_split(const MKArgs& a, const LayerParams& P, const flo
 }
 
 // Merge the S attention partials into xs[T][D] (normalised), every block redundantly; replaces S5's input load.
+// All partial values a thread needs are loaded before any arithmetic, so the merge costs ~one L2 round trip.
 template <int TT>
 __device__ void attn_combine(const MKArgs& a, int S, float* xs) {
-  for (int idx = threadIdx.x; idx < TT * D; idx += blockDim.x) {
+  constexpr int PER = (TT * D + 255) / 256;          // outputs per thread (blockDim = 256)
+  float mv[PER][4], lv[PER][4], ov[PER][4];
+#pragma unroll
+  for (int p = 0; p < PER; ++p) {
+    const int idx = threadIdx.x + p * 256;
     const int t = idx / D, hd = idx % D, h = hd / DK, d = hd % DK;
     const int item0 = (h * TT + t) * S;
-    float M = NEG_INF;
-    for (int s = 0; s < S; ++s) M = fmaxf(M, a.att[2 * (item0 + s)]);
-    float L = 0.f, o = 0.f;
-    if (M != NEG_INF) {
-      for (int s = 0; s < S; ++s) {
-        const float m = a.att[2 * (item0 + s)];
-        const float w = (m == NEG_INF) ? 0.f : __expf(m - M);
-        L += w * a.att[2 * (item0 + s) + 1];
-        o += w * a.hbuf[(item0 + s) * DK + d];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      if (idx < TT * D && s < S) {
+        mv[p][s] = a.att[2 * (item0 + s)];
+        lv[p][s] = a.att[2 * (item0 + s) + 1];
+        ov[p][s] = a.hbuf[(item0 + s) * DK + d];
+      } else {
+        mv[p][s] = NEG_INF; lv[p][s] = 0.f; ov[p][s] = 0.f;
       }
     }
-    xs[idx] = (L > 0.f) ? o / L : 0.f;              // all keys masked -> zeros (NeMo semantics)
+  }
+#pragma unroll
+  for (int p = 0; p < PER; ++p) {
+    const int idx = threadIdx.x + p * 256;
+    if (idx < TT * D) {
+      float M = NEG_INF;
+#pragma unroll
+      for (int s = 0; s < 4; ++s) M = fmaxf(M, mv[p][s]);
+      float L = 0.f, o = 0.f;
+      if (M != NEG_INF) {
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+          const float w = (mv[p][s] == NEG_INF) ? 0.f : __expf(mv[p][s] - M);
+          L += w * lv[p][s];
+          o += w * ov[p][s];
+        }
+      }
+      xs[idx] = (L > 0.f) ? o / L : 0.f;            // all keys masked -> zeros (NeMo semantics)
+    }
   }
   __syncthreads();
 }
@@ -413,16 +435,18 @@ __device__ void attn_combine(const MKArgs& a, int S, float* xs) {
 // A warp computes R rows at once (R*K/256 16-byte loads per lane, all issued before the first FMA), so a stage pays
 // ~one DRAM round trip instead of one per loop iteration per row. R = 4 for K = 512, 1 for K = 2048 (32 registers).
 // PAIR: each work item is a channel c needing rows c and c+D (conv PW1 + GLU); R counts channels then.
+// contig: a warp takes R ADJACENT rows (one contiguous R*K*2-byte stretch) instead of rows nwarps apart.
 template <int K, int R, int PAIR, int TT, typename Epi>
 __device__ __forceinline__ void gemv_rows(const half* __restrict__ W, int N, const float* xs, int gwarp,
-                                          int nwarps, int lane, Epi epi) {
+                                          int nwarps, int lane, bool contig, Epi epi) {
   constexpr int IT = K / 256;
   constexpr int NQ = PAIR ? 2 : 1;
-  for (int base = gwarp; base < N; base += R * nwarps) {
+  const int di = contig ? 1 : nwarps;
+  for (int base = contig ? gwarp * R : gwarp; base < N; base += R * nwarps) {
     uint4 w[R][NQ][IT];
 #pragma unroll
     for (int i = 0; i < R; ++i) {
-      const int r = base + i * nwarps;
+      const int r = base + i * di;
       if (r < N) {
 #pragma unroll
         for (int q = 0; q < NQ; ++q)
@@ -433,7 +457,7 @@ __device__ __forceinline__ void gemv_rows(const half* __restrict__ W, int N, con
     }
 #pragma unroll
     for (int i = 0; i < R; ++i) {
-      const int r = base + i * nwarps;
+      const int r = base + i * di;
       if (r < N) {                                   // warp-uniform condition
         float acc[NQ][TT];
 #pragma unroll
@@ -478,6 +502,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
   const int S_att = max(1, min(4, (int)gridDim.x / (NH * TT)));   // attention key splits (blocks per head x query)
   const int head_ring = *a.ring_head;
   const bool do_l2pf = (a.flags & 1) != 0, fuse_ln = (a.flags & 2) != 0;   // bit2 (register prefetch) retired in v5
+  const bool contig = (a.flags & 8) != 0;                                     // bit3: adjacent rows per warp
 
   STAMP(0);
   if (do_l2pf) prefetch_layer(a.layers[0], gtid, nthreads);
@@ -504,7 +529,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
       block_load_k<D, TT>(resid, P.ln_ff1_g, P.ln_ff1_b, a.eps, 0, xs, red);
     }
     PSTAMP(0, 0);
-    gemv_rows<D, 4, 0, TT>(P.w_ff1_1, DFF, xs, gwarp, nwarps, lane, [&](int r, float* acc, float*) {
+    gemv_rows<D, 4, 0, TT>(P.w_ff1_1, DFF, xs, gwarp, nwarps, lane, contig, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_ff1_1[r]; for (int t = 0; t < T; ++t) a.hbuf[t * DFF + r] = silu(acc[t] + bb); }
     });
     PSTAMP(0, 1);
@@ -513,7 +538,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
     // S2: FFN1 down; resid += fc * out
     block_load_k<DFF, TT>(a.hbuf, nullptr, nullptr, a.eps, 0, xs, red);
     PSTAMP(1, 0);
-    gemv_rows<DFF, 1, 0, TT>(P.w_ff1_2, D, xs, gwarp, nwarps, lane, [&](int r, float* acc, float*) {
+    gemv_rows<DFF, 1, 0, TT>(P.w_ff1_2, D, xs, gwarp, nwarps, lane, contig, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_ff1_2[r]; for (int t = 0; t < T; ++t) resid[t * D + r] += a.fc_factor * (acc[t] + bb); }
     });
     PSTAMP(1, 1);
@@ -522,7 +547,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
     // S3: LN_att + Q|K|V
     block_load_k<D, TT>(resid, P.ln_att_g, P.ln_att_b, a.eps, 0, xs, red);
     PSTAMP(2, 0);
-    gemv_rows<D, 4, 0, TT>(P.w_qkv, 3 * D, xs, gwarp, nwarps, lane, [&](int r, float* acc, float*) {
+    gemv_rows<D, 4, 0, TT>(P.w_qkv, 3 * D, xs, gwarp, nwarps, lane, contig, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_qkv[r]; for (int t = 0; t < T; ++t) a.qkv[t * 3 * D + r] = acc[t] + bb; }
     });
     PSTAMP(2, 1);
@@ -540,7 +565,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
     // S5: output projection; resid += out; commit new K/V into the oldest ring slots
     attn_combine<TT>(a, S_att, xs);
     PSTAMP(4, 0);
-    gemv_rows<D, 4, 0, TT>(P.w_o, D, xs, gwarp, nwarps, lane, [&](int r, float* acc, float*) {
+    gemv_rows<D, 4, 0, TT>(P.w_o, D, xs, gwarp, nwarps, lane, contig, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_o[r]; for (int t = 0; t < T; ++t) resid[t * D + r] += acc[t] + bb; }
     });
     for (int i = gtid; i < T * D; i += nthreads) {
@@ -554,7 +579,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
     // S6: conv module part 1 (per-channel, owned by one warp): PW1 rows c and c+D, GLU, causal DW conv
     block_load_k<D, TT>(resid, P.ln_conv_g, P.ln_conv_b, a.eps, 0, xs, red);
     PSTAMP(5, 0);
-    gemv_rows<D, 2, 1, TT>(P.w_pw1, D, xs, gwarp, nwarps, lane, [&](int c, float* ga, float* gb) {
+    gemv_rows<D, 2, 1, TT>(P.w_pw1, D, xs, gwarp, nwarps, lane, contig, [&](int c, float* ga, float* gb) {
       if (lane == 0) {
         float hist[KC + TT];
         for (int j = 0; j < KC; ++j) hist[j] = cc[c * KC + j];
@@ -576,7 +601,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
     // S7: conv module part 2: LN_cn(y) + SiLU -> PW2; resid += out
     block_load_k<D, TT>(a.ybuf, P.ln_cn_g, P.ln_cn_b, a.eps, 1, xs, red);
     PSTAMP(6, 0);
-    gemv_rows<D, 4, 0, TT>(P.w_pw2, D, xs, gwarp, nwarps, lane, [&](int r, float* acc, float*) {
+    gemv_rows<D, 4, 0, TT>(P.w_pw2, D, xs, gwarp, nwarps, lane, contig, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_pw2[r]; for (int t = 0; t < T; ++t) resid[t * D + r] += acc[t] + bb; }
     });
     PSTAMP(6, 1);
@@ -585,7 +610,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
     // S8: LN_ff2 + FFN2 up + SiLU
     block_load_k<D, TT>(resid, P.ln_ff2_g, P.ln_ff2_b, a.eps, 0, xs, red);
     PSTAMP(7, 0);
-    gemv_rows<D, 4, 0, TT>(P.w_ff2_1, DFF, xs, gwarp, nwarps, lane, [&](int r, float* acc, float*) {
+    gemv_rows<D, 4, 0, TT>(P.w_ff2_1, DFF, xs, gwarp, nwarps, lane, contig, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_ff2_1[r]; for (int t = 0; t < T; ++t) a.hbuf[t * DFF + r] = silu(acc[t] + bb); }
     });
     PSTAMP(7, 1);
@@ -594,7 +619,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
     // S9: FFN2 down; resid += fc * out
     block_load_k<DFF, TT>(a.hbuf, nullptr, nullptr, a.eps, 0, xs, red);
     PSTAMP(8, 0);
-    gemv_rows<DFF, 1, 0, TT>(P.w_ff2_2, D, xs, gwarp, nwarps, lane, [&](int r, float* acc, float*) {
+    gemv_rows<DFF, 1, 0, TT>(P.w_ff2_2, D, xs, gwarp, nwarps, lane, contig, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_ff2_2[r]; for (int t = 0; t < T; ++t) resid[t * D + r] += a.fc_factor * (acc[t] + bb); }
     });
     PSTAMP(8, 1);

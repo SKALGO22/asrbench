@@ -120,8 +120,8 @@ def main():
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--stages", action="store_true")
     ap.add_argument("--paced", action="store_true")
-    ap.add_argument("--flags", type=int, default=2, help="bit0 L2 prefetch, bit1 fused LN_out")
-    ap.add_argument("--ablation", action="store_true", help="layers-only latency for flags 0,1,2,3")
+    ap.add_argument("--flags", type=int, default=2, help="bit0 L2 prefetch, bit1 fused LN_out, bit3 adjacent rows per warp")
+    ap.add_argument("--ablation", action="store_true", help="layers-only latency for flags 0,2,8,10")
     ap.add_argument("--out", default="results")
     args = ap.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -167,10 +167,10 @@ def main():
                     configs.append((th, k * n_sm))
             del probe
     if args.ablation:
-        names = {0: "LN_out separate, no L2 prefetch", 1: "+ L2 prefetch of next layer", 2: "+ fused LN_out",
-                 3: "both"}
+        names = {0: "LN_out separate, strided rows", 2: "+ fused LN_out", 8: "+ adjacent rows per warp",
+                 10: "fused LN_out + adjacent rows"}
         th, bl = configs[0]
-        for fl in (0, 1, 2, 3):
+        for fl in (0, 2, 8, 10):
             mk = make_mk(model, consts, th, bl, False, xs, xlen, drop, flags=fl)
             for _ in range(30):
                 mk.layers_step()
