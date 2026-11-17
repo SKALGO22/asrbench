@@ -319,7 +319,7 @@ class MegakernelEncoder:
             L = lib()
             check(L.mk_prepare(threads), "mk_prepare")
             per_sm = ctypes.c_int(0)
-            check(L.mk_max_blocks_per_sm(threads, ctypes.byref(per_sm)), "occupancy")
+            check(L.mk_max_blocks_per_sm(threads, self.T, ctypes.byref(per_sm)), "occupancy")
             n_sm = torch.cuda.get_device_properties(0).multi_processor_count
             self.max_blocks = per_sm.value * n_sm
             self.blocks = blocks or n_sm
@@ -405,7 +405,7 @@ class MegakernelEncoder:
             for s in range(NSTAGE - 1):
                 start = t[1 + l * NSTAGE + s]           # end of the previous stage (or of the input copy)
                 end = t[2 + l * NSTAGE + s]
-                a0, a1 = p[l, s, 0], p[l, s, 1]
+                a0, a1 = p[l][s][0], p[l][s][1]
                 row.append(((a0 - start) / 1e3, (a1 - a0) / 1e3, (end - a1) / 1e3))
             out.append(row)
         return out
