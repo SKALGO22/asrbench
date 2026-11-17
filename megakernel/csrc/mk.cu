@@ -1,4 +1,4 @@
-// Megakernel v5.1 (v5 + one kernel instantiation per frames-per-chunk T, compile-time loops): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
+// Megakernel v6 (v5.1 + split-K attention over up to 4 blocks per (head, query), merged in S5's load): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
 //
 // Stages per layer (each separated by a grid-wide barrier, 10 per layer):
 //   S1  LN_ff1(resid) -> FFN1 up (512->2048) + SiLU                -> h
@@ -303,6 +303,109 @@ __device__ void attention_block(const MKArgs& a, const LayerParams& P, const flo
   __syncthreads();
 }
 
+// Split-K attention (flash-decoding style). Item (h, t, s) handles keys [s*per, (s+1)*per) of query t, head h, and
+// writes an UNNORMALISED partial: max m, sum l = sum exp(score - m), o[d] = sum exp(score - m) * v[d].
+// The consumer stage (S5) merges the S partials while loading its input, so no extra barrier is needed.
+__device__ void attention_split(const MKArgs& a, const LayerParams& P, const float* kvK, const float* kvV,
+                                int head_ring, int h, int t, int s, int S, float* scratch) {
+  const int T = a.T, NK = CACHE + T;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, wpb = blockDim.x >> 5;
+  const int per = (NK + S - 1) / S;
+  const int j0 = s * per;
+  const int nkeys = max(0, min(NK, j0 + per) - j0);
+  const int item = (h * T + t) * S + s;
+  float* qu = scratch;
+  float* qv = scratch + DK;
+  float* sc = scratch + 2 * DK;
+  float* part = sc + NKEY_PAD;
+  float* bc = part + 8 * DK;                          // broadcast m, l
+  if (threadIdx.x < DK) {
+    const float qd = a.qkv[t * 3 * D + h * DK + threadIdx.x];
+    qu[threadIdx.x] = qd + P.pos_u[h * DK + threadIdx.x];
+    qv[threadIdx.x] = qd + P.pos_v[h * DK + threadIdx.x];
+  }
+  __syncthreads();
+  {
+    const int kq = lane >> 3, sub = lane & 7;
+    const float4 qu0 = *reinterpret_cast<const float4*>(qu + sub * 8), qu1 = *reinterpret_cast<const float4*>(qu + sub * 8 + 4);
+    const float4 qv0 = *reinterpret_cast<const float4*>(qv + sub * 8), qv1 = *reinterpret_cast<const float4*>(qv + sub * 8 + 4);
+    for (int base = warp * 4; base < nkeys; base += wpb * 4) {
+      const int jj = base + kq, j = j0 + jj;
+      const bool valid = (jj < nkeys) && (a.mask[t * NK + j] == 0);
+      float v = 0.f;
+      if (valid) {
+        const float* krow = ((j < CACHE) ? kvK + ring_slot(head_ring, j) * D : a.qkv + (j - CACHE) * 3 * D + D) + h * DK + sub * 8;
+        const float4 k0 = *reinterpret_cast<const float4*>(krow), k1 = *reinterpret_cast<const float4*>(krow + 4);
+        v = qu0.x * k0.x + qu0.y * k0.y + qu0.z * k0.z + qu0.w * k0.w + qu1.x * k1.x + qu1.y * k1.y + qu1.z * k1.z + qu1.w * k1.w;
+        const int pi = a.pidx[t * NK + j];
+        if (pi >= 0) {
+          const float* prow = P.p + ((size_t)h * a.npos + pi) * DK + sub * 8;
+          const float4 p0 = *reinterpret_cast<const float4*>(prow), p1 = *reinterpret_cast<const float4*>(prow + 4);
+          v += qv0.x * p0.x + qv0.y * p0.y + qv0.z * p0.z + qv0.w * p0.w + qv1.x * p1.x + qv1.y * p1.y + qv1.z * p1.z + qv1.w * p1.w;
+        }
+      }
+      v += __shfl_xor_sync(0xffffffffu, v, 4);
+      v += __shfl_xor_sync(0xffffffffu, v, 2);
+      v += __shfl_xor_sync(0xffffffffu, v, 1);
+      if (sub == 0 && jj < nkeys) sc[jj] = valid ? v * a.att_scale : NEG_INF;
+    }
+  }
+  __syncthreads();
+  if (warp == 0) {
+    float m = NEG_INF;
+    for (int jj = lane; jj < nkeys; jj += 32) m = fmaxf(m, sc[jj]);
+    m = warp_max(m);
+    float l = 0.f;
+    for (int jj = lane; jj < nkeys; jj += 32) {
+      const float e = (m == NEG_INF || sc[jj] == NEG_INF) ? 0.f : __expf(sc[jj] - m);
+      sc[jj] = e;
+      l += e;
+    }
+    l = warp_sum(l);
+    if (lane == 0) { bc[0] = m; bc[1] = l; }
+  }
+  __syncthreads();
+  const int d = threadIdx.x % DK, g = threadIdx.x / DK, G = blockDim.x / DK;
+  float o = 0.f;
+#pragma unroll 4
+  for (int jj = g; jj < nkeys; jj += G) {
+    const int j = j0 + jj;
+    const float* vrow = ((j < CACHE) ? kvV + ring_slot(head_ring, j) * D : a.qkv + (j - CACHE) * 3 * D + 2 * D) + h * DK;
+    o += sc[jj] * vrow[d];
+  }
+  part[g * DK + d] = o;
+  __syncthreads();
+  if (threadIdx.x < DK) {
+    float acc = 0.f;
+    for (int gg = 0; gg < G; ++gg) acc += part[gg * DK + threadIdx.x];
+    a.hbuf[item * DK + threadIdx.x] = acc;          // partial o   (hbuf is free between S3 and S6)
+  }
+  if (threadIdx.x == 0) { a.att[2 * item] = bc[0]; a.att[2 * item + 1] = bc[1]; }   // partial m, l
+  __syncthreads();
+}
+
+// Merge the S attention partials into xs[T][D] (normalised), every block redundantly; replaces S5's input load.
+template <int TT>
+__device__ void attn_combine(const MKArgs& a, int S, float* xs) {
+  for (int idx = threadIdx.x; idx < TT * D; idx += blockDim.x) {
+    const int t = idx / D, hd = idx % D, h = hd / DK, d = hd % DK;
+    const int item0 = (h * TT + t) * S;
+    float M = NEG_INF;
+    for (int s = 0; s < S; ++s) M = fmaxf(M, a.att[2 * (item0 + s)]);
+    float L = 0.f, o = 0.f;
+    if (M != NEG_INF) {
+      for (int s = 0; s < S; ++s) {
+        const float m = a.att[2 * (item0 + s)];
+        const float w = (m == NEG_INF) ? 0.f : __expf(m - M);
+        L += w * a.att[2 * (item0 + s) + 1];
+        o += w * a.hbuf[(item0 + s) * DK + d];
+      }
+    }
+    xs[idx] = (L > 0.f) ? o / L : 0.f;              // all keys masked -> zeros (NeMo semantics)
+  }
+  __syncthreads();
+}
+
 #define STAMP(idx) do { if (a.timers && blockIdx.x == 0 && threadIdx.x == 0) a.timers[(idx)] = gtimer(); } while (0)
 #define PSTAMP(stage, k) do { if (a.ptimers && blockIdx.x == 0 && threadIdx.x == 0) a.ptimers[((l) * NSTAGE + (stage)) * 2 + (k)] = gtimer(); } while (0)
 
@@ -372,6 +475,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
   const int gwarp = blockIdx.x * wpb + warp, nwarps = gridDim.x * wpb;
   const int gtid = blockIdx.x * blockDim.x + threadIdx.x, nthreads = gridDim.x * blockDim.x;
   constexpr int T = TT;                       // frames per chunk is a compile-time constant (one kernel per T)
+  const int S_att = max(1, min(4, (int)gridDim.x / (NH * TT)));   // attention key splits (blocks per head x query)
   const int head_ring = *a.ring_head;
   const bool do_l2pf = (a.flags & 1) != 0, fuse_ln = (a.flags & 2) != 0;   // bit2 (register prefetch) retired in v5
 
@@ -426,13 +530,15 @@ __device__ __forceinline__ void mk_body(const MKArgs& a) {
 
     // S4: attention core
     PSTAMP(3, 0);
-    for (int it = blockIdx.x; it < NH * T; it += gridDim.x)
-      attention_block(a, P, kvK, kvV, head_ring, it / T, it % T, attw);
+    for (int it = blockIdx.x; it < NH * T * S_att; it += gridDim.x) {
+      const int s_ = it % S_att, ht = it / S_att;
+      attention_split(a, P, kvK, kvV, head_ring, ht / T, ht % T, s_, S_att, attw);
+    }
     PSTAMP(3, 1);
     grid.sync(); STAMP(ts + 3);
 
     // S5: output projection; resid += out; commit new K/V into the oldest ring slots
-    block_load_k<D, TT>(a.att, nullptr, nullptr, a.eps, 0, xs, red);
+    attn_combine<TT>(a, S_att, xs);
     PSTAMP(4, 0);
     gemv_rows<D, 4, 0, TT>(P.w_o, D, xs, gwarp, nwarps, lane, [&](int r, float* acc, float*) {
       if (lane == 0) { const float bb = P.b_o[r]; for (int t = 0; t < T; ++t) resid[t * D + r] += acc[t] + bb; }
