@@ -1,4 +1,4 @@
-// Megakernel v7.1 (v7 with the mailbox read by one thread only and relayed through device memory): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
+// Megakernel v7.2 (v7.1 + NeMo-format attention-input ring so the state can be handed back to NeMo exactly): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
 //
 // Stages per layer (each separated by a grid-wide barrier, 10 per layer):
 //   S1  LN_ff1(resid) -> FFN1 up (512->2048) + SiLU                -> h
@@ -74,6 +74,8 @@ struct MKArgs {
   unsigned long long* timers; // [n_layers*NSTAGE + 3] or nullptr (block 0 records %globaltimer)
   unsigned long long* ptimers;// [n_layers*NSTAGE*2] or nullptr: block 0 stamps after its input load and after its compute
   int* mbox;                  // persistent mode: mapped host memory {seq, cmd, done, cache_len}
+  float* xring;               // [L, CACHE, D] or nullptr: NeMo-format attention-input cache (LN_att rows), so the
+                              // state can be handed back to NeMo exactly (e.g. for a short last chunk)
   int n_layers;
   int T;
   int npos;
@@ -582,6 +584,10 @@ __device__ __forceinline__ void mk_body(const MKArgs& a, const int cache_len) {
 
     // S3: LN_att + Q|K|V
     block_load_k<D, TT>(resid, P.ln_att_g, P.ln_att_b, a.eps, 0, xs, red);
+    if (a.xring) {                                  // keep NeMo's cache format alongside (slots of the oldest frames)
+      float* xr = a.xring + (size_t)l * CACHE * D;
+      for (int i = gtid; i < T * D; i += nthreads) xr[((head_ring + i / D) % CACHE) * D + (i % D)] = xs[i];
+    }
     PSTAMP(2, 0);
     gemv_rows<D, 4, 0, TT>(P.w_qkv, 3 * D, xs, gwarp, nwarps, lane, contig,
       [&](int r) { Ops<1> o; o.v[0] = P.b_qkv[r]; return o; },

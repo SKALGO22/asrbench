@@ -57,7 +57,7 @@ def build_lib(force: bool = False) -> Path:
 class MKArgs(ctypes.Structure):
     _fields_ = [(n, ctypes.c_void_p) for n in
                 ["layers", "x_in", "x_out", "kv", "conv_cache", "ring_head", "mask", "pidx", "resid0", "resid1",
-                 "hbuf", "qkv", "att", "ybuf", "timers", "ptimers", "mbox"]] + \
+                 "hbuf", "qkv", "att", "ybuf", "timers", "ptimers", "mbox", "xring"]] + \
                [("n_layers", ctypes.c_int), ("T", ctypes.c_int), ("npos", ctypes.c_int), ("flags", ctypes.c_int),
                 ("cache_len", ctypes.c_int), ("pad3_", ctypes.c_int),
                 ("eps", ctypes.c_float), ("fc_factor", ctypes.c_float), ("att_scale", ctypes.c_float),
@@ -243,6 +243,7 @@ class MKState:
         self.kv = torch.zeros(n_layers, 2, CACHE, D, dtype=torch.float32, device=device)
         self.conv = torch.zeros(n_layers, D, KC, dtype=torch.float32, device=device)
         self.head = torch.zeros(4, dtype=torch.int32, device=device)   # [0] ring head, [1..3] persistent relay
+        self.xin = torch.zeros(n_layers, CACHE, D, dtype=torch.float32, device=device)   # NeMo-format input cache
         self.cache_len = 0
 
     @torch.inference_mode()
@@ -254,8 +255,19 @@ class MKState:
             self.kv[l, 0] = a.linear_k(x).float()
             self.kv[l, 1] = a.linear_v(x).float()
             self.conv[l] = t[l, 0].float()
+            self.xin[l] = c[l, 0].float()
         self.head.zero_()
         self.cache_len = int(cl[0].item())
+
+    @torch.inference_mode()
+    def export_to_nemo(self, dtype):
+        """Rebuild NeMo's caches (cache_last_channel [L,1,CACHE,D], cache_last_time [L,1,D,KC], length [1])."""
+        head = int(self.head[0].item())
+        order = torch.tensor([(head + j) % CACHE for j in range(CACHE)], device=self.xin.device)
+        c = self.xin[:, order].unsqueeze(1).to(dtype).contiguous()
+        t = self.conv.unsqueeze(1).to(dtype).contiguous()
+        cl = torch.tensor([min(self.cache_len, CACHE)], dtype=torch.int64, device=self.xin.device)
+        return c, t, cl
 
 
 # ============================================================================== reference (same algorithm, PyTorch)
@@ -264,7 +276,7 @@ def _ln(x, g, b, eps):
 
 
 @torch.inference_mode()
-def reference_layers(layers, x, kv, conv, head, mask, pidx, sc) -> torch.Tensor:
+def reference_layers(layers, x, kv, conv, head, mask, pidx, sc, xin=None) -> torch.Tensor:
     """Exactly the stage algorithm of mk.cu, in PyTorch. Mutates kv/conv in place, returns the layer-stack output."""
     T = x.shape[0]
     NK = CACHE + T
@@ -275,7 +287,11 @@ def reference_layers(layers, x, kv, conv, head, mask, pidx, sc) -> torch.Tensor:
         W = {k: (v.float() if k in MATRIX_FIELDS else v) for k, v in P.items()}
         h = F.silu(F.linear(_ln(x, W["ln_ff1_g"], W["ln_ff1_b"], sc["eps"]), W["w_ff1_1"], W["b_ff1_1"]))
         x = x + sc["fc_factor"] * F.linear(h, W["w_ff1_2"], W["b_ff1_2"])
-        qkv = F.linear(_ln(x, W["ln_att_g"], W["ln_att_b"], sc["eps"]), W["w_qkv"], W["b_qkv"])
+        xa = _ln(x, W["ln_att_g"], W["ln_att_b"], sc["eps"])
+        if xin is not None:
+            for t in range(T):
+                xin[l, (head + t) % CACHE] = xa[t]
+        qkv = F.linear(xa, W["w_qkv"], W["b_qkv"])
         q, kn, vn = qkv[:, :D], qkv[:, D:2 * D], qkv[:, 2 * D:]
         K = torch.cat([kv[l, 0][order], kn], 0)
         V = torch.cat([kv[l, 1][order], vn], 0)
@@ -354,20 +370,23 @@ class MegakernelEncoder:
             self.params = torch.tensor(ptrs, dtype=torch.int64, device=device)
 
     def _mask(self):
+        """NeMo's chunked-limited mask for the current cache length: the oldest (CACHE - cache_len) cached keys are
+        masked, everything else visible (verified equal to NeMo's own masks for every cache length)."""
         cl = min(self.state.cache_len, CACHE)
-        if cl not in self.mask_by_len:
-            raise KeyError(f"no captured attention mask for cache length {cl}; captured: {sorted(self.mask_by_len)}")
-        return self.mask_by_len[cl]
+        m = torch.zeros(self.T, self.NK, dtype=torch.uint8, device=self.device)
+        m[:, :CACHE - cl] = 1
+        return m
 
     def layers_step(self, x: Optional[torch.Tensor] = None) -> torch.Tensor:
         """x: (T, D) float32 on device (already pre-encoded), or None if self.x_in was already filled (e.g. by a
         captured pre-encode graph). Returns (T, D) float32 view of the output buffer."""
-        mask = self._mask()
         if x is None:
             x = self.x_in
         if not self.use_kernel:
+            mask = self._mask()
             head = int(self.state.head[0].item())
-            out = reference_layers(self.layers, x, self.state.kv, self.state.conv, head, mask, self.pidx, self.sc)
+            out = reference_layers(self.layers, x, self.state.kv, self.state.conv, head, mask, self.pidx, self.sc,
+                                   xin=self.state.xin)
             self.state.head[0] = (head + self.T) % CACHE
             self.state.cache_len += self.T
             self.x_out.copy_(out)
@@ -377,7 +396,8 @@ class MegakernelEncoder:
         a = MKArgs()
         a.layers = self.params.data_ptr(); a.x_in = self.x_in.data_ptr(); a.x_out = self.x_out.data_ptr()
         a.kv = self.state.kv.data_ptr(); a.conv_cache = self.state.conv.data_ptr(); a.ring_head = self.state.head.data_ptr()
-        a.mask = mask.data_ptr(); a.pidx = self.pidx.data_ptr()
+        a.mask = None; a.pidx = self.pidx.data_ptr()        # mask synthesised in-kernel from cache_len
+        a.xring = self.state.xin.data_ptr()
         for k, v in self.bufs.items():
             setattr(a, k, v.data_ptr())
         a.timers = self.timers.data_ptr() if self.timers is not None else None
@@ -402,6 +422,7 @@ class MegakernelEncoder:
         for k, v in self.bufs.items():
             setattr(a, k, v.data_ptr())
         a.timers = None; a.ptimers = None; a.mbox = mbox_ptr
+        a.xring = self.state.xin.data_ptr()
         a.n_layers, a.T, a.npos = self.nl, self.T, self.npos
         a.flags = self.flags if flags is None else flags
         a.cache_len = cache_len
