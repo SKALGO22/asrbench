@@ -98,12 +98,13 @@ def main():
     ap.add_argument("--flags", type=int, default=2)
     ap.add_argument("--iters", type=int, default=500)
     ap.add_argument("--paced", type=int, default=150)
+    ap.add_argument("--int8", action="store_true", help="weight-only INT8 megakernel")
     ap.add_argument("--out", default="results")
     args = ap.parse_args()
     model = load(args.model, "cuda", args.fp32)
     consts = capture_constants(model)
     mels, xlen, drop = random_chunks(model, 70, "cuda", seed=5)
-    mk = MegakernelEncoder(model, consts, flags=args.flags)
+    mk = MegakernelEncoder(model, consts, flags=args.flags, quant="int8" if args.int8 else "fp16")
     c, t, cl = nemo_initial(model, "cuda")
     for x in mels[:40]:
         _, c, t, cl = nemo_step(model, x, xlen, c, t, cl, drop)
@@ -124,7 +125,7 @@ def main():
     resf = open(outd / "megakernel_persistent.jsonl", "a")
 
     def record(rec):
-        rec.update(gpu=gpu, flags=args.flags, ts=time.strftime("%Y-%m-%dT%H:%M:%S"))
+        rec.update(gpu=gpu, flags=args.flags, weights="int8" if args.int8 else "fp16", ts=time.strftime("%Y-%m-%dT%H:%M:%S"))
         resf.write(json.dumps(rec) + "\n"); resf.flush()
 
     def restore():

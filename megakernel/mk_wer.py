@@ -169,6 +169,7 @@ def main():
     ap.add_argument("--reference", action="store_true", help="PyTorch reference instead of the CUDA kernel")
     ap.add_argument("--synthetic", action="store_true", help="random audio instead of LibriSpeech (plumbing test)")
     ap.add_argument("--flags", type=int, default=2)
+    ap.add_argument("--int8", action="store_true", help="weight-only INT8 megakernel")
     ap.add_argument("--out", default="results")
     args = ap.parse_args()
     dev = args.device
@@ -176,7 +177,8 @@ def main():
     model.eval()
     setup_decoding(model)
     consts = capture_constants(model)
-    mk = MegakernelEncoder(model, consts, use_kernel=not args.reference, device=dev, flags=args.flags)
+    mk = MegakernelEncoder(model, consts, use_kernel=not args.reference, device=dev, flags=args.flags,
+                           quant="int8" if args.int8 else "fp16")
 
     if args.synthetic:
         rng = np.random.default_rng(0)
@@ -211,7 +213,8 @@ def main():
     print(f"[wer] megakernel chunks {patch.stats['mk_chunks']}, NeMo chunks (first / short last) {patch.stats['nemo_chunks']}")
     res = {"n_utts": len(items), "chunks": len(diffs), "enc_max_abs_diff": max(finite), "enc_rel_err_median": float(np.median(rel)),
            "enc_rel_err_max": max(rel), **patch.stats, "seconds_nemo": t_nemo, "seconds_mk": t_mk,
-           "model_precision": "fp16" if args.fp16 else "fp32", "kernel": not args.reference, "flags": args.flags}
+           "model_precision": "fp16" if args.fp16 else "fp32", "kernel": not args.reference, "flags": args.flags,
+           "weights": "int8" if args.int8 else "fp16"}
     if not args.synthetic:
         errs_n = errs_m = words = 0
         differ = []

@@ -16,7 +16,8 @@
 | v6.2 | every load a stage needs is issued up front (epilogue operands, gamma/beta, masks in shared memory); 512-row stages 1 row per warp | A6000: correct; layers 0.953 ms (flags 0) / 0.925 ms (flags 2, best); step ≈1.07 ms = 2.15x vs NeMo CUDA Graph (2.30), 1.86x vs B (1.99); paced 1.36 vs 2.59 ms. Most stages within ~1 µs of the latency-bandwidth model; remaining gaps: attention+merge (~5 µs/layer), S1 (~2 µs). Default flags 2 |
 | v7 | persistent mode (flag 16): resident kernel, mailbox in zero-copy host memory; masks synthesised in-kernel from cache_len | A6000: outputs identical to launch mode (max diff 0) but 2.1x slower (b2b 1949 vs 929 µs): after each barrier all 21.5k threads read the mailbox over PCIe. Idle: 107 W (no kernel) vs 122 W (resident). Launch per chunk, zero-copy: b2b 929 µs, paced p50 1065 / p99 1155 µs, SM clock min 1800 MHz. cudnn.benchmark: no effect on pre-encode (146 µs) |
 | v7.1 | only thread 0 of block 0 reads the mailbox; it relays {seq, cmd, cache_len} through device memory | A6000 (layers, zero-copy host in/out): launch b2b 937 / paced p50 1088, p99 1160, max 1200 µs; persistent b2b 909 / paced p50 983, p99 1018, max 1018 µs. Paced penalty halves (+16%/+24% → +8%/+12%), p99 -12%, max -15%. Cost: power while waiting 102 W → 142 W. Outputs identical |
-| v7.2 | kernel also writes NeMo's attention-input cache (LN_att rows) into a ring, so the state converts back to NeMo exactly; `mk_wer.py`: end-to-end streaming WER, megakernel for all steady chunks, NeMo for the first and a short last chunk (exact hand-over both ways) | CPU plumbing test (reference path): encoder outputs worst rel.err 3.8e-6 over all chunks, transcripts identical |
+| v7.2 | kernel also writes NeMo's attention-input cache (LN_att rows) into a ring, so the state converts back to NeMo exactly; `mk_wer.py`: end-to-end streaming WER, megakernel for all steady chunks, NeMo for the first and a short last chunk (exact hand-over both ways) | A6000, first 200 test-clean utterances (4,634 words): NeMo FP32 streaming WER 4.34%, megakernel 4.34%, 0 transcripts differ; 11,171 of 11,466 chunks ran in the megakernel; encoder output median rel.err 1.6e-4 vs FP32 NeMo |
+| v8 | weight-only INT8 (flag 32): per-output-row symmetric scales, 16 weights per 16-byte load, scale applied after the warp reduction; FP16 and INT8 kernels instantiated side by side (T=2: 225 / 236 registers, no spills). Library builds are now atomic (safe while another run uses it) | CPU reference: INT8 vs FP32 NeMo rel.err ≈ 2–3% per chunk (FP16: 1.5e-4); WER decides |
 
 v1 (this folder) runs all 17 layers of `parakeet_realtime_eou_120m` for one 160 ms chunk in **one cooperative
 launch**: 142 thread blocks (one per SM on an L40S) stay alive for the whole chunk and hand work to each other through
@@ -57,6 +58,7 @@ python megakernel/mk_bench.py --ablation         # flag combinations
 python megakernel/mk_persist.py                  # persistent vs launch-per-chunk: latency, paced, power, clocks
 python megakernel/mk_bench.py --cudnn-bench      # pre-encode / NeMo baseline with cudnn.benchmark
 python megakernel/mk_wer.py --data data/LibriSpeech/test-clean --n 200   # streaming WER: NeMo vs megakernel
+python megakernel/mk_test.py --fp32 --int8 ; python megakernel/mk_bench.py --stages --int8 ; python megakernel/mk_wer.py --int8 --n 200
 ```
 
 The library is rebuilt automatically when `csrc/mk.cu` changes (`build/libmk.so`). Override the target with
@@ -100,7 +102,8 @@ Per layer, 10 stages separated by `grid.sync()` (170 per chunk):
 | v6.2 | all loads of a stage issued up front | done: layers 0.925 ms, 2.15x vs NeMo CUDA Graph |
 | v7 | persistent kernel + zero-copy mailbox | done: correct, but PCIe mailbox reads by every thread made it 2x slower |
 | v7.1 | single-thread mailbox relay | done: paced p99 -12%, +40 W while waiting |
-| v7.2 | exact hand-back to NeMo + end-to-end WER (this folder) | WER parity on LibriSpeech test-clean |
+| v7.2 | exact hand-back to NeMo + end-to-end WER | done: identical WER on 200 utterances |
+| v8 | weight-only INT8 (this folder) | latency with half the bytes; WER cost |
 | v2 | fewer barriers: fuse S10 into the next S1, S5's commit into S6, LN stats reuse | latency vs number of barriers (170 → ~120) |
 | v3 | counters instead of `grid.sync`: a warp waits only for the rows it needs (e.g. S2 rows wait for S1) | barrier cost vs dependency-wait cost |
 | v4 | prefetch next stage's weights into shared memory with `cp.async` during the barrier | achieved bandwidth per stage |

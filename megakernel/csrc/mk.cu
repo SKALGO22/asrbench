@@ -1,4 +1,4 @@
-// Megakernel v7.2 (v7.1 + NeMo-format attention-input ring so the state can be handed back to NeMo exactly): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
+// Megakernel v8 (v7.2 + weight-only INT8 with per-row FP32 scales, flag 32): the 17 Conformer layers of one cache-aware streaming step in ONE cooperative launch.
 //
 // Stages per layer (each separated by a grid-wide barrier, 10 per layer):
 //   S1  LN_ff1(resid) -> FFN1 up (512->2048) + SiLU                -> h
@@ -38,22 +38,24 @@ namespace cg = cooperative_groups;
 
 struct LayerParams {          // ALL fields are pointers: the host packs an int64 array in exactly this order
   const float *ln_ff1_g, *ln_ff1_b;
-  const half *w_ff1_1;  const float *b_ff1_1;   // [DFF, D]
-  const half *w_ff1_2;  const float *b_ff1_2;   // [D, DFF]
+  const void *w_ff1_1;  const float *b_ff1_1;   // [DFF, D]
+  const void *w_ff1_2;  const float *b_ff1_2;   // [D, DFF]
   const float *ln_att_g, *ln_att_b;
-  const half *w_qkv;    const float *b_qkv;     // [3D, D]  rows: q | k | v
-  const half *w_o;      const float *b_o;       // [D, D]
+  const void *w_qkv;    const float *b_qkv;     // [3D, D]  rows: q | k | v
+  const void *w_o;      const float *b_o;       // [D, D]
   const float *pos_u, *pos_v;                   // [NH, DK]
   const float *p;                               // [NH, npos, DK]  linear_pos(pos_emb), precomputed
   const float *ln_conv_g, *ln_conv_b;
-  const half *w_pw1;    const float *b_pw1;     // [2D, D]
+  const void *w_pw1;    const float *b_pw1;     // [2D, D]
   const float *w_dw, *b_dw;                     // [D, KS], [D]
   const float *ln_cn_g, *ln_cn_b;               // conv-module LayerNorm
-  const half *w_pw2;    const float *b_pw2;     // [D, D]
+  const void *w_pw2;    const float *b_pw2;     // [D, D]
   const float *ln_ff2_g, *ln_ff2_b;
-  const half *w_ff2_1;  const float *b_ff2_1;
-  const half *w_ff2_2;  const float *b_ff2_2;
+  const void *w_ff2_1;  const float *b_ff2_1;
+  const void *w_ff2_2;  const float *b_ff2_2;
   const float *ln_out_g, *ln_out_b;
+  // INT8 mode (flag bit5): the eight w_* pointers above hold int8 rows and these hold per-row FP32 scales
+  const float *s_ff1_1, *s_ff1_2, *s_qkv, *s_o, *s_pw1, *s_pw2, *s_ff2_1, *s_ff2_2;
 };
 
 struct MKArgs {
@@ -79,7 +81,7 @@ struct MKArgs {
   int n_layers;
   int T;
   int npos;
-  int flags;                  // bit0 L2-prefetch next layer, bit1 fused LN_out, bit3 adjacent rows, bit4 persistent
+  int flags;                  // bit0 L2-prefetch next layer, bit1 fused LN_out, bit3 adjacent rows, bit4 persistent, bit5 int8 weights
   int cache_len;              // valid cached frames before this chunk (used when mask == nullptr)
   int pad3_;
   float eps;
@@ -203,13 +205,14 @@ __device__ void block_ln_inplace(float* xs, int T, int K, const float* g, const 
 __device__ __forceinline__ void prefetch_l2(const void* p) { asm volatile("prefetch.global.L2 [%0];" ::"l"(p)); }
 
 // Fire-and-forget L2 prefetch of one layer's eight weight matrices (~12.6 MB), spread over every thread of the grid.
+template <int QW>
 __device__ void prefetch_layer(const LayerParams& P, int gtid, int nthreads) {
-  const half* mats[8] = {P.w_ff1_1, P.w_ff1_2, P.w_qkv, P.w_o, P.w_pw1, P.w_pw2, P.w_ff2_1, P.w_ff2_2};
+  const void* mats[8] = {P.w_ff1_1, P.w_ff1_2, P.w_qkv, P.w_o, P.w_pw1, P.w_pw2, P.w_ff2_1, P.w_ff2_2};
   const int nel[8] = {DFF * D, D * DFF, 3 * D * D, D * D, 2 * D * D, D * D, DFF * D, D * DFF};
 #pragma unroll
   for (int m = 0; m < 8; ++m) {
     const char* base = reinterpret_cast<const char*>(mats[m]);
-    const int lines = nel[m] * 2 / 128;
+    const int lines = nel[m] * (QW ? 1 : 2) / 128;
     for (int i = gtid; i < lines; i += nthreads) prefetch_l2(base + (size_t)i * 128);
   }
 }
@@ -456,23 +459,29 @@ template <int N_> struct Ops { float v[N_]; };      // per-row epilogue operands
 // contig: a warp takes R ADJACENT rows (one contiguous R*K*2-byte stretch) instead of rows nwarps apart.
 // pre(r) loads the row's epilogue operands right after its weight loads are issued, so they arrive in the same
 // round trip instead of after the math; epi(r, acc, acc2, ops) consumes them.
-template <int K, int R, int PAIR, int TT, typename Pre, typename Epi>
-__device__ __forceinline__ void gemv_rows(const half* __restrict__ W, int N, const float* xs, int gwarp,
-                                          int nwarps, int lane, bool contig, Pre pre, Epi epi) {
-  constexpr int IT = K / 256;
+template <int K, int R, int PAIR, int TT, int QW, typename Pre, typename Epi>
+__device__ __forceinline__ void gemv_rows(const void* __restrict__ Wv, const float* __restrict__ Sc, int N, const float* xs,
+                                          int gwarp, int nwarps, int lane, bool contig, Pre pre, Epi epi) {
+  constexpr int EPL = QW ? 16 : 8;                 // weights per 16-byte load (int8 or fp16)
+  constexpr int IT = K / (32 * EPL);
   constexpr int NQ = PAIR ? 2 : 1;
+  const char* W = reinterpret_cast<const char*>(Wv);
   const int di = contig ? 1 : nwarps;
   for (int base = contig ? gwarp * R : gwarp; base < N; base += R * nwarps) {
     uint4 w[R][NQ][IT];
+    float scl[R][NQ];
 #pragma unroll
     for (int i = 0; i < R; ++i) {
       const int r = base + i * di;
       if (r < N) {
 #pragma unroll
-        for (int q = 0; q < NQ; ++q)
+        for (int q = 0; q < NQ; ++q) {
 #pragma unroll
           for (int it = 0; it < IT; ++it)
-            w[i][q][it] = __ldg(reinterpret_cast<const uint4*>(W + (size_t)(r + q * D) * K + lane * 8 + it * 256));
+            w[i][q][it] = __ldg(reinterpret_cast<const uint4*>(
+                W + ((size_t)(r + q * D) * K + lane * EPL + it * 32 * EPL) * (QW ? 1 : 2)));
+          scl[i][q] = QW ? __ldg(Sc + r + q * D) : 1.f;
+        }
       }
     }
     decltype(pre(0)) ops[R];
@@ -492,21 +501,29 @@ __device__ __forceinline__ void gemv_rows(const half* __restrict__ W, int N, con
           for (int t = 0; t < TT; ++t) acc[q][t] = 0.f;
 #pragma unroll
           for (int it = 0; it < IT; ++it) {
-            const half2* w2 = reinterpret_cast<const half2*>(&w[i][q][it]);
-            float wf[8];
+            float wf[EPL];
+            if (QW) {
+              const signed char* qb = reinterpret_cast<const signed char*>(&w[i][q][it]);
 #pragma unroll
-            for (int e = 0; e < 4; ++e) { const float2 f = __half22float2(w2[e]); wf[2 * e] = f.x; wf[2 * e + 1] = f.y; }
-            const int k = lane * 8 + it * 256;
+              for (int e = 0; e < EPL; ++e) wf[e] = (float)qb[e];
+            } else {
+              const half2* w2 = reinterpret_cast<const half2*>(&w[i][q][it]);
+#pragma unroll
+              for (int e = 0; e < 4; ++e) { const float2 f = __half22float2(w2[e]); wf[2 * e] = f.x; wf[2 * e + 1] = f.y; }
+            }
+            const int k = lane * EPL + it * 32 * EPL;
 #pragma unroll
             for (int t = 0; t < TT; ++t) {
               const float4* xr = reinterpret_cast<const float4*>(xs + t * K + k);
-              const float4 a0 = xr[0], a1 = xr[1];
-              acc[q][t] += wf[0] * a0.x + wf[1] * a0.y + wf[2] * a0.z + wf[3] * a0.w
-                         + wf[4] * a1.x + wf[5] * a1.y + wf[6] * a1.z + wf[7] * a1.w;
+#pragma unroll
+              for (int e4 = 0; e4 < EPL / 4; ++e4) {
+                const float4 xv = xr[e4];
+                acc[q][t] += wf[4 * e4] * xv.x + wf[4 * e4 + 1] * xv.y + wf[4 * e4 + 2] * xv.z + wf[4 * e4 + 3] * xv.w;
+              }
             }
           }
 #pragma unroll
-          for (int t = 0; t < TT; ++t) acc[q][t] = warp_sum(acc[q][t]);
+          for (int t = 0; t < TT; ++t) acc[q][t] = warp_sum(acc[q][t]) * scl[i][q];
         }
         epi(r, acc[0], acc[NQ - 1], ops[i]);
       }
@@ -514,7 +531,7 @@ __device__ __forceinline__ void gemv_rows(const half* __restrict__ W, int N, con
   }
 }
 
-template <int TT>
+template <int TT, int QW>
 __device__ __forceinline__ void mk_body(const MKArgs& a, const int cache_len) {
   cg::grid_group grid = cg::this_grid();
   extern __shared__ float smem[];
@@ -539,7 +556,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a, const int cache_len) {
       mp[i] = masked ? MASKED : a.pidx[i];
     }
   }
-  if (do_l2pf) prefetch_layer(a.layers[0], gtid, nthreads);
+  if (do_l2pf) prefetch_layer<QW>(a.layers[0], gtid, nthreads);
   for (int i = gtid; i < T * D; i += nthreads) a.resid0[i] = a.x_in[i];
   grid.sync(); STAMP(1);
   float* resid = a.resid0;
@@ -551,7 +568,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a, const int cache_len) {
     float* kvV = kvK + (size_t)CACHE * D;
     float* cc = a.conv_cache + (size_t)l * D * KC;
     const int ts = 2 + l * NSTAGE;
-    if (do_l2pf && l + 1 < a.n_layers) prefetch_layer(a.layers[l + 1], gtid, nthreads);
+    if (do_l2pf && l + 1 < a.n_layers) prefetch_layer<QW>(a.layers[l + 1], gtid, nthreads);
 
     // S1: [LN_out of the previous layer, if fused] + LN_ff1 + FFN1 up + SiLU
     if (fuse_ln && l > 0) {
@@ -563,7 +580,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a, const int cache_len) {
       block_load_k<D, TT>(resid, P.ln_ff1_g, P.ln_ff1_b, a.eps, 0, xs, red);
     }
     PSTAMP(0, 0);
-    gemv_rows<D, 4, 0, TT>(P.w_ff1_1, DFF, xs, gwarp, nwarps, lane, contig,
+    gemv_rows<D, 4, 0, TT, QW>(P.w_ff1_1, P.s_ff1_1, DFF, xs, gwarp, nwarps, lane, contig,
       [&](int r) { Ops<1> o; o.v[0] = P.b_ff1_1[r]; return o; },
       [&](int r, float* acc, float*, const Ops<1>& o) {
         if (lane == 0) for (int t = 0; t < T; ++t) a.hbuf[t * DFF + r] = silu(acc[t] + o.v[0]);
@@ -574,7 +591,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a, const int cache_len) {
     // S2: FFN1 down; resid += fc * out
     block_load_k<DFF, TT>(a.hbuf, nullptr, nullptr, a.eps, 0, xs, red);
     PSTAMP(1, 0);
-    gemv_rows<DFF, 1, 0, TT>(P.w_ff1_2, D, xs, gwarp, nwarps, lane, contig,
+    gemv_rows<DFF, 1, 0, TT, QW>(P.w_ff1_2, P.s_ff1_2, D, xs, gwarp, nwarps, lane, contig,
       [&](int r) { Ops<1 + TT> o; o.v[0] = P.b_ff1_2[r]; for (int t = 0; t < TT; ++t) o.v[1 + t] = resid[t * D + r]; return o; },
       [&](int r, float* acc, float*, const Ops<1 + TT>& o) {
         if (lane == 0) for (int t = 0; t < T; ++t) resid[t * D + r] = o.v[1 + t] + a.fc_factor * (acc[t] + o.v[0]);
@@ -589,7 +606,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a, const int cache_len) {
       for (int i = gtid; i < T * D; i += nthreads) xr[((head_ring + i / D) % CACHE) * D + (i % D)] = xs[i];
     }
     PSTAMP(2, 0);
-    gemv_rows<D, 4, 0, TT>(P.w_qkv, 3 * D, xs, gwarp, nwarps, lane, contig,
+    gemv_rows<D, 4, 0, TT, QW>(P.w_qkv, P.s_qkv, 3 * D, xs, gwarp, nwarps, lane, contig,
       [&](int r) { Ops<1> o; o.v[0] = P.b_qkv[r]; return o; },
       [&](int r, float* acc, float*, const Ops<1>& o) {
         if (lane == 0) for (int t = 0; t < T; ++t) a.qkv[t * 3 * D + r] = acc[t] + o.v[0];
@@ -609,7 +626,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a, const int cache_len) {
     // S5: output projection; resid += out; commit new K/V into the oldest ring slots
     attn_combine<TT>(a, S_att, xs);
     PSTAMP(4, 0);
-    gemv_rows<D, 1, 0, TT>(P.w_o, D, xs, gwarp, nwarps, lane, contig,
+    gemv_rows<D, 1, 0, TT, QW>(P.w_o, P.s_o, D, xs, gwarp, nwarps, lane, contig,
       [&](int r) { Ops<1 + TT> o; o.v[0] = P.b_o[r]; for (int t = 0; t < TT; ++t) o.v[1 + t] = resid[t * D + r]; return o; },
       [&](int r, float* acc, float*, const Ops<1 + TT>& o) {
         if (lane == 0) for (int t = 0; t < T; ++t) resid[t * D + r] = o.v[1 + t] + acc[t] + o.v[0];
@@ -625,7 +642,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a, const int cache_len) {
     // S6: conv module part 1 (per-channel, owned by one warp): PW1 rows c and c+D, GLU, causal DW conv
     block_load_k<D, TT>(resid, P.ln_conv_g, P.ln_conv_b, a.eps, 0, xs, red);
     PSTAMP(5, 0);
-    gemv_rows<D, 1, 1, TT>(P.w_pw1, D, xs, gwarp, nwarps, lane, contig,
+    gemv_rows<D, 1, 1, TT, QW>(P.w_pw1, P.s_pw1, D, xs, gwarp, nwarps, lane, contig,
       [&](int c) {                                    // b_pw1 (a, gate), b_dw, w_dw[KS], conv cache[KC]
         Ops<3 + KS + KC> o;
         o.v[0] = P.b_pw1[c]; o.v[1] = P.b_pw1[c + D]; o.v[2] = P.b_dw[c];
@@ -659,7 +676,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a, const int cache_len) {
     // S7: conv module part 2: LN_cn(y) + SiLU -> PW2; resid += out
     block_load_k<D, TT>(a.ybuf, P.ln_cn_g, P.ln_cn_b, a.eps, 1, xs, red);
     PSTAMP(6, 0);
-    gemv_rows<D, 1, 0, TT>(P.w_pw2, D, xs, gwarp, nwarps, lane, contig,
+    gemv_rows<D, 1, 0, TT, QW>(P.w_pw2, P.s_pw2, D, xs, gwarp, nwarps, lane, contig,
       [&](int r) { Ops<1 + TT> o; o.v[0] = P.b_pw2[r]; for (int t = 0; t < TT; ++t) o.v[1 + t] = resid[t * D + r]; return o; },
       [&](int r, float* acc, float*, const Ops<1 + TT>& o) {
         if (lane == 0) for (int t = 0; t < T; ++t) resid[t * D + r] = o.v[1 + t] + acc[t] + o.v[0];
@@ -670,7 +687,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a, const int cache_len) {
     // S8: LN_ff2 + FFN2 up + SiLU
     block_load_k<D, TT>(resid, P.ln_ff2_g, P.ln_ff2_b, a.eps, 0, xs, red);
     PSTAMP(7, 0);
-    gemv_rows<D, 4, 0, TT>(P.w_ff2_1, DFF, xs, gwarp, nwarps, lane, contig,
+    gemv_rows<D, 4, 0, TT, QW>(P.w_ff2_1, P.s_ff2_1, DFF, xs, gwarp, nwarps, lane, contig,
       [&](int r) { Ops<1> o; o.v[0] = P.b_ff2_1[r]; return o; },
       [&](int r, float* acc, float*, const Ops<1>& o) {
         if (lane == 0) for (int t = 0; t < T; ++t) a.hbuf[t * DFF + r] = silu(acc[t] + o.v[0]);
@@ -681,7 +698,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a, const int cache_len) {
     // S9: FFN2 down; resid += fc * out
     block_load_k<DFF, TT>(a.hbuf, nullptr, nullptr, a.eps, 0, xs, red);
     PSTAMP(8, 0);
-    gemv_rows<DFF, 1, 0, TT>(P.w_ff2_2, D, xs, gwarp, nwarps, lane, contig,
+    gemv_rows<DFF, 1, 0, TT, QW>(P.w_ff2_2, P.s_ff2_2, D, xs, gwarp, nwarps, lane, contig,
       [&](int r) { Ops<1 + TT> o; o.v[0] = P.b_ff2_2[r]; for (int t = 0; t < TT; ++t) o.v[1 + t] = resid[t * D + r]; return o; },
       [&](int r, float* acc, float*, const Ops<1 + TT>& o) {
         if (lane == 0) for (int t = 0; t < T; ++t) resid[t * D + r] = o.v[1 + t] + a.fc_factor * (acc[t] + o.v[0]);
@@ -712,7 +729,7 @@ __device__ __forceinline__ void mk_body(const MKArgs& a, const int cache_len) {
 // grid.sync(), so all SMs stay busy and clocks stay up between chunks. Only that one thread ever reads host memory:
 // v7 let all 21.5k threads read the mailbox over PCIe after each barrier, which cost ~1 ms per chunk.
 // Host protocol: write x_in, cache_len, cmd, then seq += 1; the kernel runs the step and sets done = seq.
-template <int TT>
+template <int TT, int QW>
 __device__ void mk_persistent(const MKArgs& a) {
   cg::grid_group grid = cg::this_grid();
   volatile int* mb = a.mbox;                        // host memory: {seq, cmd, done, cache_len}
@@ -733,7 +750,7 @@ __device__ void mk_persistent(const MKArgs& a) {
     const int seq = s_cmd[0], cmd = s_cmd[1], cl = s_cmd[2];
     if (cmd == 2) break;
     last = seq;
-    mk_body<TT>(a, cl);
+    mk_body<TT, QW>(a, cl);
     grid.sync();                                    // all output and state writes done
     if (blockIdx.x == 0 && threadIdx.x == 0) {
       __threadfence_system();
@@ -742,18 +759,30 @@ __device__ void mk_persistent(const MKArgs& a) {
   }
 }
 
-template <int TT>
+template <int TT, int QW>
 __device__ __forceinline__ void mk_entry(const MKArgs& a) {
-  if (a.flags & 16) mk_persistent<TT>(a);
-  else mk_body<TT>(a, a.cache_len);
+  if (a.flags & 16) mk_persistent<TT, QW>(a);
+  else mk_body<TT, QW>(a, a.cache_len);
 }
 
-extern "C" __global__ void __launch_bounds__(256) mk_kernel_t1(MKArgs a) { mk_entry<1>(a); }
-extern "C" __global__ void __launch_bounds__(256) mk_kernel_t2(MKArgs a) { mk_entry<2>(a); }
-extern "C" __global__ void __launch_bounds__(256) mk_kernel_t3(MKArgs a) { mk_entry<3>(a); }
-extern "C" __global__ void __launch_bounds__(256) mk_kernel_t4(MKArgs a) { mk_entry<4>(a); }
+extern "C" __global__ void __launch_bounds__(256) mk_kernel_t1(MKArgs a) { mk_entry<1, 0>(a); }
+extern "C" __global__ void __launch_bounds__(256) mk_kernel_t2(MKArgs a) { mk_entry<2, 0>(a); }
+extern "C" __global__ void __launch_bounds__(256) mk_kernel_t3(MKArgs a) { mk_entry<3, 0>(a); }
+extern "C" __global__ void __launch_bounds__(256) mk_kernel_t4(MKArgs a) { mk_entry<4, 0>(a); }
+extern "C" __global__ void __launch_bounds__(256) mk_kernel_q1(MKArgs a) { mk_entry<1, 1>(a); }
+extern "C" __global__ void __launch_bounds__(256) mk_kernel_q2(MKArgs a) { mk_entry<2, 1>(a); }
+extern "C" __global__ void __launch_bounds__(256) mk_kernel_q3(MKArgs a) { mk_entry<3, 1>(a); }
+extern "C" __global__ void __launch_bounds__(256) mk_kernel_q4(MKArgs a) { mk_entry<4, 1>(a); }
 
-static const void* kernel_for(int T) {
+static const void* kernel_for(int T, int q = 0) {
+  if (q) {
+    switch (T) {
+      case 1: return (const void*)mk_kernel_q1;
+      case 2: return (const void*)mk_kernel_q2;
+      case 3: return (const void*)mk_kernel_q3;
+      default: return (const void*)mk_kernel_q4;
+    }
+  }
   switch (T) {
     case 1: return (const void*)mk_kernel_t1;
     case 2: return (const void*)mk_kernel_t2;
@@ -767,10 +796,11 @@ extern "C" int mk_smem_bytes(int threads) { (void)threads; return (TMAX * DFF + 
 
 extern "C" int mk_prepare(int threads) {
   const int smem = mk_smem_bytes(threads);
-  for (int t = 1; t <= TMAX; ++t) {
-    const int e = (int)cudaFuncSetAttribute(kernel_for(t), cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    if (e) return e;
-  }
+  for (int q = 0; q < 2; ++q)
+    for (int t = 1; t <= TMAX; ++t) {
+      const int e = (int)cudaFuncSetAttribute(kernel_for(t, q), cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+      if (e) return e;
+    }
   return 0;
 }
 
@@ -781,7 +811,7 @@ extern "C" int mk_max_blocks_per_sm(int threads, int T, int* out) {
 extern "C" int mk_launch(const MKArgs* args, int blocks, int threads, void* stream) {
   MKArgs local = *args;
   void* kargs[] = {(void*)&local};
-  return (int)cudaLaunchCooperativeKernel(kernel_for(local.T), dim3(blocks), dim3(threads), kargs,
+  return (int)cudaLaunchCooperativeKernel(kernel_for(local.T, (local.flags & 32) ? 1 : 0), dim3(blocks), dim3(threads), kargs,
                                           (size_t)mk_smem_bytes(threads), (cudaStream_t)stream);
 }
 

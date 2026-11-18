@@ -100,8 +100,11 @@ class NemoGraph:
         self.g.replay()
 
 
+QUANT = "fp16"
+
+
 def make_mk(model, consts, threads, blocks, timers, xs, xlen, drop, flags=2):
-    mk = MegakernelEncoder(model, consts, threads=threads, blocks=blocks, timers=timers, flags=flags)
+    mk = MegakernelEncoder(model, consts, threads=threads, blocks=blocks, timers=timers, flags=flags, quant=QUANT)
     c, t, cl = nemo_initial(model, "cuda")
     for x in xs[:40]:
         _, c, t, cl = nemo_step(model, x, xlen, c, t, cl, drop)
@@ -122,10 +125,15 @@ def main():
     ap.add_argument("--paced", action="store_true")
     ap.add_argument("--flags", type=int, default=2, help="bit0 L2 prefetch, bit1 fused LN_out, bit3 adjacent rows per warp")
     ap.add_argument("--ablation", action="store_true", help="layers-only latency for flags 0,2,8")
+    ap.add_argument("--int8", action="store_true", help="weight-only INT8 megakernel")
     ap.add_argument("--cudnn-bench", action="store_true", help="torch.backends.cudnn.benchmark = True (affects NeMo baseline and pre-encode)")
     ap.add_argument("--out", default="results")
     args = ap.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
+    global QUANT
+    QUANT = "int8" if args.int8 else "fp16"
+    if args.int8:
+        print("[mk ] weights: INT8 (per-row scales)")
     if args.cudnn_bench:
         torch.backends.cudnn.benchmark = True
         print("[mk ] cudnn.benchmark = True")
@@ -142,9 +150,11 @@ def main():
     n_sm = torch.cuda.get_device_properties(0).multi_processor_count
     prec = "fp32" if args.fp32 else "fp16"
     weight_bytes = sum(p.numel() * p.element_size() for p in model.encoder.layers.parameters()) // (2 if args.fp32 else 1)
+    if args.int8:
+        weight_bytes //= 2
 
     def record(rec):
-        rec.update(gpu=gpu, precision=prec, cudnn_benchmark=bool(args.cudnn_bench), ts=time.strftime("%Y-%m-%dT%H:%M:%S"))
+        rec.update(gpu=gpu, precision=prec, weights=QUANT, cudnn_benchmark=bool(args.cudnn_bench), ts=time.strftime("%Y-%m-%dT%H:%M:%S"))
         resf.write(json.dumps(rec) + "\n"); resf.flush()
 
     # baseline: NeMo CUDA Graph (full step)
@@ -165,7 +175,7 @@ def main():
     if args.sweep:
         configs = []
         for th in (256,):                     # v5 kernel: 256 threads/block (250 registers)
-            probe = MegakernelEncoder(model, consts, threads=th, blocks=n_sm)
+            probe = MegakernelEncoder(model, consts, threads=th, blocks=n_sm, quant=QUANT)
             for k in (1, 2, 3, 4):
                 if k * n_sm <= probe.max_blocks:
                     configs.append((th, k * n_sm))
@@ -236,7 +246,8 @@ def main():
         rows = []
         for s in range(NSTAGE):
             m = statistics.median(per[s])
-            gbs = STAGE_WEIGHT_BYTES[s] / m / 1e3 if STAGE_WEIGHT_BYTES[s] else 0.0
+            wb = STAGE_WEIGHT_BYTES[s] // (2 if args.int8 else 1)
+            gbs = wb / m / 1e3 if wb else 0.0
             r = {"stage": STAGE_NAMES[s], "median_us": m, "weight_bytes": STAGE_WEIGHT_BYTES[s], "gbs": gbs}
             extra = ""
             if s < NSTAGE - 1:

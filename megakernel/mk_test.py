@@ -56,6 +56,7 @@ def main():
     ap.add_argument("--threads", type=int, default=256)
     ap.add_argument("--blocks", type=int, default=0)
     ap.add_argument("--flags", type=int, default=2, help="bit0 L2 prefetch, bit1 fused LN_out, bit3 adjacent rows (default 2)")
+    ap.add_argument("--int8", action="store_true", help="weight-only INT8 (per-row scales)")
     ap.add_argument("--tol", type=float, default=0.0, help="max allowed relative error (default: 2e-2 FP16, 1e-3 FP32)")
     args = ap.parse_args()
     torch.manual_seed(0)
@@ -66,14 +67,15 @@ def main():
     print(f"[mk] constants: T={consts['T']} NK={consts['NK']} npos={consts['npos']} "
           f"masks for cache lengths {sorted(consts['masks'])[:3]}...{sorted(consts['masks'])[-2:]} ({time.time()-t0:.1f}s)")
     mk = MegakernelEncoder(model, consts, threads=args.threads, blocks=args.blocks or None,
-                           use_kernel=not args.reference, device=dev, flags=args.flags)
+                           use_kernel=not args.reference, device=dev, flags=args.flags,
+                           quant="int8" if args.int8 else "fp16")
     if args.layers:
         mk.nl = args.layers
         mk.layers = mk.layers[:args.layers]
         if mk.use_kernel:
             mk.params = mk.params[:args.layers * len(mk.layers[0])].contiguous()
     print(f"[mk] mode: {'reference (PyTorch)' if args.reference else f'CUDA kernel, grid {mk.blocks} x {mk.threads}'}"
-          f", layers {mk.nl}, flags {args.flags}")
+          f", layers {mk.nl}, flags {args.flags}, weights {'INT8' if args.int8 else 'FP16'}")
 
     xs, xlen, drop = random_chunks(model, args.warm + args.steps, dev, seed=7)
     c, t, cl = nemo_initial(model, dev)
@@ -116,7 +118,7 @@ def main():
         k_ref = a0.linear_k(c[0, 0]).float()
         k_r = rel(mk.state.kv[0, 0][order], k_ref)[0]
       print(f"  caches after {args.steps} chunks: conv rel.err {conv_r:.2e}, layer-0 K rel.err {k_r:.2e}")
-    tol = args.tol or (1e-3 if args.fp32 else 2e-2)
+    tol = args.tol or (5e-2 if args.int8 else (1e-3 if args.fp32 else 2e-2))
     ok = worst <= tol
     print(f"[mk] worst rel.err {worst:.2e} (tolerance {tol:.0e}) -> {'PASS' if ok else 'FAIL'}")
     sys.exit(0 if ok else 1)

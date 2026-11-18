@@ -34,8 +34,19 @@ STAGE_WEIGHT_BYTES = [DFF * D * 2, D * DFF * 2, 3 * D * D * 2, 0, D * D * 2, 2 *
 LAYER_FIELDS = ["ln_ff1_g", "ln_ff1_b", "w_ff1_1", "b_ff1_1", "w_ff1_2", "b_ff1_2", "ln_att_g", "ln_att_b",
                 "w_qkv", "b_qkv", "w_o", "b_o", "pos_u", "pos_v", "p", "ln_conv_g", "ln_conv_b", "w_pw1",
                 "b_pw1", "w_dw", "b_dw", "ln_cn_g", "ln_cn_b", "w_pw2", "b_pw2", "ln_ff2_g", "ln_ff2_b",
-                "w_ff2_1", "b_ff2_1", "w_ff2_2", "b_ff2_2", "ln_out_g", "ln_out_b"]
+                "w_ff2_1", "b_ff2_1", "w_ff2_2", "b_ff2_2", "ln_out_g", "ln_out_b",
+                "s_ff1_1", "s_ff1_2", "s_qkv", "s_o", "s_pw1", "s_pw2", "s_ff2_1", "s_ff2_2"]
 MATRIX_FIELDS = {"w_ff1_1", "w_ff1_2", "w_qkv", "w_o", "w_pw1", "w_pw2", "w_ff2_1", "w_ff2_2"}
+SCALE_OF = {"w_ff1_1": "s_ff1_1", "w_ff1_2": "s_ff1_2", "w_qkv": "s_qkv", "w_o": "s_o", "w_pw1": "s_pw1",
+            "w_pw2": "s_pw2", "w_ff2_1": "s_ff2_1", "w_ff2_2": "s_ff2_2"}
+
+
+def quantize_rows_int8(w: torch.Tensor):
+    """Symmetric per-output-row INT8: w ~= q * scale[:, None], q in [-127, 127]."""
+    w = w.float()
+    scale = (w.abs().amax(dim=1) / 127.0).clamp(min=1e-12)
+    q = torch.round(w / scale[:, None]).clamp(-127, 127).to(torch.int8).contiguous()
+    return q, scale.contiguous()
 
 
 # ============================================================================== build + ctypes
@@ -47,10 +58,12 @@ def build_lib(force: bool = False) -> Path:
         return out
     arch = os.environ.get("MK_ARCH", "-gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_86,code=sm_86")
     nvcc = os.environ.get("NVCC", "nvcc")
+    tmp = out.with_suffix(f".tmp{os.getpid()}.so")
     cmd = [nvcc, "-O3", "-std=c++17", "-shared", "-Xcompiler", "-fPIC", "-cudart", "shared", "-lineinfo",
-           *arch.split(), str(src), "-o", str(out)]
+           *arch.split(), str(src), "-o", str(tmp)]
     print("[mk] building:", " ".join(cmd), flush=True)
     subprocess.run(cmd, check=True)
+    os.replace(tmp, out)            # atomic: a process that already loaded the old library keeps running
     return out
 
 
@@ -190,9 +203,11 @@ def _vec(t, n, device):
 
 
 @torch.inference_mode()
-def pack_layers(model, consts, device="cuda", wdtype=torch.float16) -> List[Dict[str, torch.Tensor]]:
-    """Per-layer tensors keyed by LAYER_FIELDS. Matrices in `wdtype` (FP16 for the kernel), vectors FP32."""
+def pack_layers(model, consts, device="cuda", wdtype=torch.float16, quant="fp16") -> List[Dict[str, torch.Tensor]]:
+    """Per-layer tensors keyed by LAYER_FIELDS. Matrices in `wdtype` (FP16 for the kernel) or, with quant="int8",
+    per-row INT8 with FP32 scales in the s_* fields; vectors FP32."""
     layers = []
+    ones = torch.ones(3 * D if 3 * D > DFF else DFF, dtype=torch.float32, device=device)
     pos_emb = consts["pos_emb"]
     for L in model.encoder.layers:
         a, c = L.self_attn, L.conv
@@ -223,6 +238,11 @@ def pack_layers(model, consts, device="cuda", wdtype=torch.float16) -> List[Dict
             "w_ff2_2": mat(L.feed_forward2.linear2.weight), "b_ff2_2": _vec(L.feed_forward2.linear2.bias, D, device),
             "ln_out_g": _vec(L.norm_out.weight, D, device), "ln_out_b": _vec(L.norm_out.bias, D, device),
         }
+        for wf, sf in SCALE_OF.items():
+            if quant == "int8":
+                d[wf], d[sf] = quantize_rows_int8(d[wf])
+            else:
+                d[sf] = ones                                    # unused by the FP16 kernel
         assert set(d) == set(LAYER_FIELDS)
         layers.append(d)
     return layers
@@ -284,7 +304,12 @@ def reference_layers(layers, x, kv, conv, head, mask, pidx, sc, xin=None) -> tor
     m = mask.bool().to(x.device)
     pi = pidx.long().to(x.device)
     for l, P in enumerate(layers):
-        W = {k: (v.float() if k in MATRIX_FIELDS else v) for k, v in P.items()}
+        W = {}
+        for k, v in P.items():
+            if k in MATRIX_FIELDS:
+                W[k] = v.float() * P[SCALE_OF[k]][:, None] if v.dtype == torch.int8 else v.float()
+            else:
+                W[k] = v
         h = F.silu(F.linear(_ln(x, W["ln_ff1_g"], W["ln_ff1_b"], sc["eps"]), W["w_ff1_1"], W["b_ff1_1"]))
         x = x + sc["fc_factor"] * F.linear(h, W["w_ff1_2"], W["b_ff1_2"])
         xa = _ln(x, W["ln_att_g"], W["ln_att_b"], sc["eps"])
@@ -329,7 +354,7 @@ class MegakernelEncoder:
     """One streaming encoder step = NeMo pre-encode (subsampling + pos-enc scaling) + the megakernel for all layers."""
 
     def __init__(self, model, consts, threads: int = 256, blocks: Optional[int] = None, timers: bool = False,
-                 use_kernel: bool = True, device="cuda", wdtype=None, flags: int = 2):
+                 use_kernel: bool = True, device="cuda", wdtype=None, flags: int = 2, quant: str = "fp16"):
         self.model, self.enc, self.consts = model, model.encoder, consts
         self.device = device
         self.T = consts["T"]
@@ -339,13 +364,14 @@ class MegakernelEncoder:
         self.sc = model_scalars(model)
         if wdtype is None:   # the kernel needs FP16 matrices; the reference can use the model's own precision
             wdtype = torch.float16 if use_kernel else model_dtype(model)
-        self.layers = pack_layers(model, consts, device=device, wdtype=wdtype)
+        self.quant = quant
+        self.layers = pack_layers(model, consts, device=device, wdtype=wdtype, quant=quant)
         self.nl = len(self.layers)
         self.state = MKState(self.nl, device)
         self.pidx = consts["pidx"].to(device)
         self.mask_by_len = {k: v.to(device) for k, v in consts["masks"].items()}
         self.use_kernel = use_kernel
-        self.flags = flags          # bit0: L2 prefetch next layer, bit1: fused LN_out, bit3: adjacent rows (default 0 since v6.1)
+        self.flags = flags | (32 if quant == "int8" else 0)   # bit0 L2 prefetch, bit1 fused LN_out, bit3 adjacent rows, bit5 int8
         T = self.T
         z = lambda *s: torch.zeros(*s, dtype=torch.float32, device=device)  # noqa: E731
         self.x_in, self.x_out = z(T, D), z(T, D)
@@ -424,7 +450,7 @@ class MegakernelEncoder:
         a.timers = None; a.ptimers = None; a.mbox = mbox_ptr
         a.xring = self.state.xin.data_ptr()
         a.n_layers, a.T, a.npos = self.nl, self.T, self.npos
-        a.flags = self.flags if flags is None else flags
+        a.flags = (self.flags if flags is None else flags) | (32 if self.quant == "int8" else 0)
         a.cache_len = cache_len
         a.eps, a.fc_factor, a.att_scale = self.sc["eps"], self.sc["fc_factor"], self.sc["att_scale"]
         check(lib().mk_launch(ctypes.byref(a), self.blocks, self.threads, stream), "mk_launch")
